@@ -1,12 +1,13 @@
 import json
 import os
+import re
 import subprocess
 import time
 
-# --- الإعدادات الثابتة للتجربة ---
-TEST_UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"  # ضع الـ UUID الخاص بك هنا
+# --- الإعدادات ---
+TEST_UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 TEST_EMAIL = "tester@vpn.local"
-BAN_DURATION = 10  # مدة الفصل/الحظر بالثواني عند اكتشاف المشاركة
+BAN_DURATION = 15  # مدة الفصل بالثواني
 
 XRAY_CONFIG_PATH = "/usr/local/etc/xray/config.json"
 XRAY_BIN = "/usr/local/bin/xray"
@@ -14,23 +15,18 @@ API_SERVER = "127.0.0.1:10085"
 INBOUND_TAG = "vless-inbound"
 LOG_PATH = "/var/log/xray/access.log"
 
-# حالة المستخدم في الذاكرة
-user_state = {
-    "email": TEST_EMAIL,
-    "uuid": TEST_UUID,
-    "is_active": True,
-    "banned_until": 0,
-}
+is_banned = False
+unban_time = 0
 
 
 def log(msg):
     print(
-        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [MANAGER] {msg}", flush=True
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [ANTI-SHARE] {msg}", flush=True
     )
 
 
-def restart_xray():
-    """كتابة الإعدادات وإعادة تشغيل Xray بالـ UUID المختار"""
+def init_xray():
+    """تشغيل Xray مرة واحدة فقط عند البداية"""
     config = {
         "log": {
             "access": LOG_PATH,
@@ -87,124 +83,132 @@ def restart_xray():
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
-    subprocess.run(["pkill", "-f", "xray"], stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-9", "-f", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.Popen([XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH])
-    user_state["is_active"] = True
-    log(f"🚀 Xray started with UUID: {TEST_UUID} ({TEST_EMAIL})")
+    log(f"🚀 Xray started successfully with UUID: {TEST_UUID}")
 
 
-def kick_user():
-    """حذف العميل من Xray فوراً لقطع اتصاله"""
-    cmd = f'{XRAY_BIN} api rmu --server={API_SERVER} -tag="{INBOUND_TAG}" "{TEST_EMAIL}"'
+def api_remove_user():
+    """طرد المستخدم عبر API فوراً"""
+    cmd = [
+        XRAY_BIN,
+        "api",
+        "rmu",
+        f"--server={API_SERVER}",
+        f"-tag={INBOUND_TAG}",
+        TEST_EMAIL,
+    ]
     subprocess.run(
-        cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    user_state["is_active"] = False
-    user_state["banned_until"] = time.time() + BAN_DURATION
     log(
-        f"⛔ User {TEST_EMAIL} KICKED! Connection blocked for {BAN_DURATION}s."
+        f"⛔ User {TEST_EMAIL} REMOVED via API. Connection dropped for {BAN_DURATION}s."
     )
 
 
-def re_add_user():
-    """إعادة إضافة المستخدم بعد انتهاء مدة الحظر المؤقت"""
-    client_json = json.dumps({"id": TEST_UUID, "email": TEST_EMAIL})
-    # إضافة المستخدم مجدداً عبر API بدون الحاجة لإعادة تشغيل السيرفر
+def api_add_user():
+    """إرجاع العميل للخدمة عبر API بعد انتهاء العقوبة"""
+    client_data = json.dumps({"id": TEST_UUID, "email": TEST_EMAIL})
     cmd = [
         XRAY_BIN,
         "api",
         "adu",
         f"--server={API_SERVER}",
         f"-tag={INBOUND_TAG}",
-        client_json,
+        client_data,
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
-
     if res.returncode == 0:
-        user_state["is_active"] = True
-        log(f"✅ Ban expired. User {TEST_EMAIL} re-added and active again.")
+        log(f"✅ User {TEST_EMAIL} restored via API successfully.")
     else:
-        # إذا فشل الـ API adu يتم عمل restart سريع
-        restart_xray()
+        log(f"⚠️ Failed to restore user via API: {res.stderr.strip()}")
 
 
-def detect_sharing_and_punish():
-    """فحص سجل الاتصال والتحقق من نشاط أكثر من IP خلال ثانيتين"""
-    if not os.path.exists(LOG_PATH) or not user_state["is_active"]:
+# نمط Regex يستخرج: التاريخ والوقت (بدون أجزاء الثانية)، عنوان الـ IP، والإيميل
+# مثال: 2026/08/19 18:48:49.713692 from 129.45.83.252:0 accepted ... email: tester@vpn.local
+LOG_REGEX = re.compile(
+    r"^(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\.\d+\s+from\s+([^:]+):\d+\s+accepted.*email:\s*(\S+)"
+)
+
+
+def detect_multi_ip():
+    """فحص السجلات لرصد الـ IPs النشطة لكل حساب"""
+    global is_banned, unban_time
+
+    if not os.path.exists(LOG_PATH) or is_banned:
         return
 
     try:
         with open(LOG_PATH, "r") as f:
-            lines = f.readlines()[-300:]
+            lines = f.readlines()[-200:]
     except Exception:
         return
 
     now_ts = time.time()
-    ip_tracker = {}  # ip -> last_timestamp
+    active_ips = {}  # ip -> last_seen_timestamp
 
     for line in lines:
-        if (
-            "from " not in line
-            or f"email: {TEST_EMAIL}" not in line
-            and "email:" not in line
-        ):
+        match = LOG_REGEX.search(line.strip())
+        if not match:
             continue
 
-        parts = line.split()
+        time_str, client_ip, email = match.groups()
+
+        if email != TEST_EMAIL:
+            continue
+
         try:
-            date_part = parts[0]
-            time_part = parts[1]
+            # تحويل الوقت مع إهمال أجزاء الثانية
             log_ts = time.mktime(
-                time.strptime(f"{date_part} {time_part}", "%Y/%m/%d %H:%M:%S")
+                time.strptime(time_str, "%Y/%m/%d %H:%M:%S")
             )
 
-            # تجاهل السجلات القديمة أكثر من 5 ثوانٍ
-            if now_ts - log_ts > 5:
-                continue
-
-            from_idx = parts.index("from")
-            client_ip = parts[from_idx + 1].split(":")[0]
-
-            ip_tracker[client_ip] = max(ip_tracker.get(client_ip, 0), log_ts)
+            # فحص النشاط في آخر 4 ثوانٍ فقط
+            if abs(now_ts - log_ts) <= 4:
+                active_ips[client_ip] = max(
+                    active_ips.get(client_ip, 0), log_ts
+                )
         except Exception:
             continue
 
-    # التحقق إذا كان هناك 2 IP أو أكثر
-    if len(ip_tracker) >= 2:
-        sorted_ips = sorted(ip_tracker.items(), key=lambda x: x[1], reverse=True)
-        ip_new, ts_new = sorted_ips[0]
-        ip_old, ts_old = sorted_ips[1]
+    # إذا وجدنا أكثر من IP نشط لنفس الإيميل في نفس اللحظة
+    if len(active_ips) >= 2:
+        is_banned = True
+        unban_time = time.time() + BAN_DURATION
 
-        # شرط الكشف: كلا الـ IPين أرسلا طلبات في آخر ثانيتين
-        if (now_ts - ts_new <= 2) and (now_ts - ts_old <= 2):
-            log(
-                f"🚨 Multi-IP detected! IP1: {ip_old} ({int(now_ts - ts_old)}s ago) | IP2: {ip_new} ({int(now_ts - ts_new)}s ago)"
-            )
-            kick_user()
+        ips_list = list(active_ips.keys())
+        log(f"🚨 Multi-IP DETECTED for {TEST_EMAIL}! IPs: {ips_list}")
 
-            # تفريغ الـ access log حتى لا يتكرر العقاب فوراً
+        # مسح السجل لتفادي تكرار العقاب
+        try:
             with open(LOG_PATH, "w") as f:
                 f.write("")
+        except Exception:
+            pass
+
+        # الفصل الفوري عبر API
+        api_remove_user()
 
 
-# --- التشغيل الأساسي ---
+# --- بداية التشغيل ---
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-open(LOG_PATH, "a").close()
+with open(LOG_PATH, "w") as f:
+    f.write("")
 
-restart_xray()
+init_xray()
+time.sleep(1)
 
 try:
     while True:
         now = time.time()
 
-        # 1. كشف المشاركة في حال كان الحساب غير محظور
-        if user_state["is_active"]:
-            detect_sharing_and_punish()
+        if not is_banned:
+            detect_multi_ip()
         else:
-            # 2. فك الحظر إذا انتهى الوقت المحدد
-            if now >= user_state["banned_until"]:
-                re_add_user()
+            if now >= unban_time:
+                api_add_user()
+                is_banned = False
 
         time.sleep(0.5)
 except KeyboardInterrupt:
