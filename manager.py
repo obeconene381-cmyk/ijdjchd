@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import subprocess
 import time
 import redis
@@ -15,16 +14,11 @@ REDIS_USERS_KEY = "users:data"
 # ==============================================================================
 # إعدادات منع مشاركة الحساب: IP واحد فقط لكل UUID
 # ==============================================================================
-ACCESS_LOG_PATH = "/var/log/xray/access.log"
 XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
 
-# كل كم ثانية نفحص اللوج
-IP_CHECK_INTERVAL = 1.0
-# كم ثانية نعتبر بعدها أن IP القديم انتهى (إذا لم يظهر في لوج القبول)
-IP_EXPIRY_SECONDS = 60
-# عدد البايتات التي نقرأها من اللوج كل دورة
-LOG_READ_CHUNK = 8192
+# كل كم ثانية نفحص الـ IPs النشطة
+IP_CHECK_INTERVAL = 2.0
 # مدة حظر الـ UUID عند اكتشاف مشاركة حساب (IP ثاني على نفس الـ UUID)
 BLOCK_DURATION = 15  # ثانية
 
@@ -100,19 +94,8 @@ def get_all_users():
 
 
 # ==============================================================================
-# دوال إدارة المستخدمين عبر Xray API (إضافة/حذف بدون إعادة تشغيل)
+# دوال إدارة المستخدمين عبر Xray API
 # ==============================================================================
-# صيغة ملف الـ JSON الذي يتوقعه أمر adu:
-# {
-#   "inbounds": [{
-#     "tag": "vless-inbound",
-#     "protocol": "vless",
-#     "settings": {
-#       "decryption": "none",
-#       "clients": [{ "id": "<uuid>", "email": "<email>" }]
-#     }
-#   }]
-# }
 def xray_api_add_user(email, uuid):
     """يضيف مستخدم عبر Xray API دون إعادة تشغيل"""
     user_config = {
@@ -155,7 +138,7 @@ def xray_api_add_user(email, uuid):
 
 
 def xray_api_remove_user(email):
-    """يحذف مستخدم عبر Xray API — هذا يقطع كل اتصالاته فوراً"""
+    """يحذف مستخدم عبر Xray API — يقطع كل اتصالاته فوراً"""
     try:
         result = subprocess.run(
             [
@@ -181,7 +164,7 @@ def kick_and_block_user(email):
     يقطع كل اتصالات المستخدم فوراً ويحظر الـ UUID لمدة BLOCK_DURATION ثانية.
     1) حذف المستخدم (rmu) — يقطع كل اتصالاته فوراً (IP القديم والجديد)
     2) لا يتم إعادة إضافته الآن — يبقى محظوراً
-    3) إعادة الإضافة تتم تلقائياً بعد انتهاء مدة الحظر في اللوب الرئيسي
+    3) إعادة الإضافة تتم تلقائياً بعد انتهاء مدة الحظر
     """
     users = get_all_users()
     if email not in users:
@@ -210,7 +193,6 @@ def unblock_user(email):
         log(f"⚠️ Cannot unblock {email}: no UUID")
         return False
 
-    # تأكد أولاً أن المستخدم ليس مضافاً بالفعل
     log(f"🔄 Unblocking {email} (adu) — re-adding to allow connections...")
     if not xray_api_add_user(email, uuid):
         log(f"❌ Failed to re-add {email} after block!")
@@ -220,92 +202,73 @@ def unblock_user(email):
 
 
 # ==============================================================================
-# مراقب اللوج: IP واحد فقط لكل UUID
+# دالة جديدة: الحصول على IPs النشطة لكل المستخدمين عبر Xray API
 # ==============================================================================
-# الريجيكس يطابق سطر اللوج:
-# 2026/08/19 18:48:49.713692 from 129.45.83.252:0 accepted tcp:57.144.204.196:443 [vless-inbound >> direct] email: tester@vpn.local
-LOG_RE = re.compile(
-    r"from\s+(\d{1,3}(?:\.\d{1,3}){3}):"   # المصدر IP
-    r"\d+\s+"                                 # المنفذ المصدر (نتجاهله)
-    r"accepted\b.*?"                          # "accepted ... "
-    r"email:\s*(\S+)"                         # البريد
-)
-
-
-def tail_access_log():
-    """مولّد يقرأ اللوج بشكل تزايدي مثل tail -f"""
-    # نتأكد من وجود الملف
-    os.makedirs(os.path.dirname(ACCESS_LOG_PATH), exist_ok=True)
-    open(ACCESS_LOG_PATH, "a").close()
-
-    # نبدأ من آخر حجم معروف للملف
-    # (نتتبع الإزاحة في الذاكرة)
-    inode = None
-    offset = 0
-
-    # إذا الملف موجود بالفعل، نبدأ من آخر موضع
+def get_online_users_ips():
+    """
+    يستعلم من Xray API عن كل المستخدمين المتصلين و IPs النشطة لكل واحد.
+    
+    يستخدم الأمر: xray api statsonlineiplist --server=... -all
+    
+    يعيد dict: { email: [ip1, ip2, ...], ... }
+    """
     try:
-        offset = os.path.getsize(ACCESS_LOG_PATH)
-        inode = os.stat(ACCESS_LOG_PATH).st_ino
-    except OSError:
-        offset = 0
+        result = subprocess.run(
+            [
+                "/usr/local/bin/xray", "api", "statsonlineiplist",
+                f"--server={XRAY_API_SERVER}",
+                "-all",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            # قد يفشل إذا لا يوجد مستخدمون متصلون بعد
+            return {}
 
-    while True:
-        try:
-            current_inode = os.stat(ACCESS_LOG_PATH).st_ino
-        except OSError:
-            yield ""
-            time.sleep(0.3)
-            continue
+        data = json.loads(result.stdout)
+        users_ips = {}
 
-        # إذا تغيّر الـ inode (تدوير اللوج)، نبدأ من البداية
-        if inode is None:
-            inode = current_inode
-            offset = 0
-        elif inode != current_inode:
-            inode = current_inode
-            offset = 0
+        # الصيغة الجديدة (مع -all): { "users": [ { "email": "...", "ips": [...] } ] }
+        if "users" in data:
+            for user in data["users"]:
+                email = user.get("email", "")
+                ips = [entry["ip"] for entry in user.get("ips", [])]
+                if email and ips:
+                    users_ips[email] = ips
 
-        try:
-            with open(ACCESS_LOG_PATH, "r") as f:
-                f.seek(offset)
-                chunk = f.read(LOG_READ_CHUNK)
-                new_offset = f.tell()
-                if new_offset > offset:
-                    offset = new_offset
-                    yield chunk
-                else:
-                    # لا يوجد جديد
-                    yield ""
-        except OSError:
-            yield ""
-            time.sleep(0.3)
+        # الصيغة القديمة: { "ips": { "1.2.3.4": timestamp } }
+        elif "ips" in data:
+            # هذا صيغة لمستخدم واحد - لن يحدث مع -all
+            pass
 
-
-def extract_ip_email_pairs(text):
-    """يستخرج أزواج (ip, email) من نص اللوج"""
-    pairs = []
-    for m in LOG_RE.finditer(text):
-        ip = m.group(1)
-        email = m.group(2).rstrip(",")
-        pairs.append((ip, email))
-    return pairs
+        return users_ips
+    except json.JSONDecodeError:
+        return {}
+    except Exception as e:
+        log(f"❌ statsonlineiplist error: {e}")
+        return {}
 
 
 # ==============================================================================
-# إعادة بناء إعدادات Xray
+# إعادة بناء إعدادات Xray — مع statsUserOnline
 # ==============================================================================
 def restart_xray(users):
     config = {
         "log": {
-            "access": "/var/log/xray/access.log",
+            "access": "none",
             "error": "/var/log/xray/error.log",
             "loglevel": "warning",
         },
         "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
         "stats": {},
         "policy": {
-            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}
+            "levels": {
+                "0": {
+                    "statsUserUplink": True,
+                    "statsUserDownlink": True,
+                    "statsUserOnline": True,  # مطلوب لـ statsonlineiplist
+                }
+            }
         },
         "inbounds": [
             {
@@ -352,15 +315,8 @@ def restart_xray(users):
         json.dump(config, f, indent=2)
     subprocess.run(["pkill", "-f", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.3)
-    # وجّه stdout و stderr الخاص بـ Xray إلى ملف اللوج
-    # لأن Cloud Run يجمع stdout فقط، لكن السكربت يحتاج قراءة الملف
-    os.makedirs(os.path.dirname(ACCESS_LOG_PATH), exist_ok=True)
-    log_file = open(ACCESS_LOG_PATH, "a")
-    err_file = open("/var/log/xray/error.log", "a")
     subprocess.Popen(
-        ["/usr/local/bin/xray", "run", "-config", XRAY_CONFIG_PATH],
-        stdout=log_file,
-        stderr=err_file,
+        ["/usr/local/bin/xray", "run", "-config", XRAY_CONFIG_PATH]
     )
     log("Xray restarted.")
 
@@ -398,7 +354,6 @@ def get_user_traffic():
 # نقطة الانطلاق
 # ==============================================================================
 os.makedirs("/var/log/xray", exist_ok=True)
-open("/var/log/xray/access.log", "a").close()
 users = get_all_users()
 restart_xray(users)
 time.sleep(2)
@@ -420,14 +375,11 @@ last_quota_check = time.time()
 # ==============================================================================
 # حالة منع مشاركة الحساب
 # ==============================================================================
-# email -> {"ip": "x.x.x.x", "first_seen": timestamp, "last_seen": timestamp}
-active_ips = {}
-# email -> timestamp متى ينتهي الحظر (None = غير محظور)
+# email -> أول IP مسجّل للمستخدم
+active_ips = {}  # email -> "x.x.x.x"
+# email -> timestamp متى ينتهي الحظر
 blocked_users = {}  # email -> unblock_at_timestamp
 last_ip_check = time.time()
-
-# نبدأ بقراءة اللوج من البداية لمسح الحالة الحالية
-log_gen = tail_access_log()
 
 
 while True:
@@ -456,7 +408,6 @@ while True:
                         if new_quota <= 0:
                             xray_api_remove_user(email)
                             log(f"🚫 Quota finished: {email}")
-                            # نظّف حالة IP لهذا المستخدم
                             if email in active_ips:
                                 del active_ips[email]
 
@@ -494,75 +445,60 @@ while True:
         if now >= unblock_at:
             unblock_user(email)
             del blocked_users[email]
-            # امسح حالة IP حتى يُسجَّل من جديد عند إعادة الاتصال
             if email in active_ips:
                 del active_ips[email]
 
     # --- 4) منع مشاركة الحساب: IP واحد فقط لكل UUID ---
+    #      نستخدم Xray API مباشرة بدلاً من قراءة اللوج
     if now - last_ip_check >= IP_CHECK_INTERVAL:
-        # اقرأ أي أسطر جديدة في اللوج
-        new_log_text = ""
-        try:
-            new_log_text = next(log_gen)
-        except StopIteration:
-            log_gen = tail_access_log()
-            new_log_text = ""
+        # استعلم عن كل المستخدمين المتصلين و IPs النشطة
+        online_users = get_online_users_ips()
 
-        if new_log_text:
-            pairs = extract_ip_email_pairs(new_log_text)
-            for ip, email in pairs:
-                # هل المستخدم معروف ولديه كوتا؟
-                if email not in users:
-                    continue
-                if users[email].get("quota_bytes", 0) <= 0:
-                    continue
+        if online_users:
+            log(f"📡 Online users: {online_users}")
 
-                entry = active_ips.get(email)
+        for email, ips in online_users.items():
+            # هل المستخدم معروف ولديه كوتا؟
+            if email not in users:
+                continue
+            if users[email].get("quota_bytes", 0) <= 0:
+                continue
 
-                if entry is None:
-                    # أول اتصال لهذا المستخدم
-                    active_ips[email] = {
-                        "ip": ip,
-                        "first_seen": now,
-                        "last_seen": now,
-                    }
-                    log(f"🟢 {email} connected from {ip}")
+            # هل المستخدم محظور حالياً؟ تجاهله
+            if email in blocked_users:
+                continue
 
-                elif entry["ip"] == ip:
-                    # نفس IP — حدّث آخر ظهور
-                    entry["last_seen"] = now
+            # كم IP نشط لديه؟
+            if len(ips) <= 1:
+                # IP واحد فقط — مسموح، سجّله
+                if email not in active_ips and ips:
+                    active_ips[email] = ips[0]
+                    log(f"🟢 {email} connected from {ips[0]}")
+                elif email in active_ips and ips:
+                    # تأكد أنه نفس IP
+                    if ips[0] != active_ips[email]:
+                        # IP تغيّر — حدّث
+                        active_ips[email] = ips[0]
+                        log(f"🔄 {email} IP changed to {ips[0]}")
+                continue
 
-                else:
-                    # IP مختلف! هذا هو سيناريو مشاركة الحساب
-                    old_ip = entry["ip"]
-                    log(
-                        f"🚨 DUPLICATE IP DETECTED: {email} "
-                        f"was on {old_ip}, now connecting from {ip}"
-                    )
+            # أكثر من IP! هذا هو سيناريو مشاركة الحساب
+            log(
+                f"🚨 DUPLICATE IP DETECTED: {email} "
+                f"has {len(ips)} IPs: {', '.join(ips)}"
+            )
 
-                    # اقطع الاتصال فوراً واحظر الـ UUID لمدة BLOCK_DURATION ثانية
-                    if kick_and_block_user(email):
-                        blocked_users[email] = now + BLOCK_DURATION
-                        # امسح حالة IP — الـ UUID محظور الآن
-                        if email in active_ips:
-                            del active_ips[email]
-                        log(
-                            f"🚫 {email}: connection CUT, UUID blocked "
-                            f"for {BLOCK_DURATION}s (was {old_ip}, tried {ip})"
-                        )
-                    else:
-                        log(
-                            f"❌ Failed to kick {email}, keeping old IP {old_ip}"
-                        )
-
-        # نظّف IPs المنتهية (لم تظهر منذ IP_EXPIRY_SECONDS)
-        expired = []
-        for email, entry in list(active_ips.items()):
-            if now - entry["last_seen"] > IP_EXPIRY_SECONDS:
-                expired.append((email, entry["ip"]))
-                del active_ips[email]
-        for email, old_ip in expired:
-            log(f"⏰ {email} IP {old_ip} expired (no activity)")
+            # اقطع الاتصال فوراً واحظر الـ UUID لمدة BLOCK_DURATION ثانية
+            if kick_and_block_user(email):
+                blocked_users[email] = now + BLOCK_DURATION
+                if email in active_ips:
+                    del active_ips[email]
+                log(
+                    f"🚫 {email}: connection CUT, UUID blocked "
+                    f"for {BLOCK_DURATION}s (IPs: {', '.join(ips)})"
+                )
+            else:
+                log(f"❌ Failed to kick {email}")
 
         last_ip_check = now
 
