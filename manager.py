@@ -1,4 +1,4 @@
-import json
+ import json
 import os
 import re
 import subprocess
@@ -352,8 +352,15 @@ def restart_xray(users):
         json.dump(config, f, indent=2)
     subprocess.run(["pkill", "-f", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.3)
+    # وجّه stdout و stderr الخاص بـ Xray إلى ملف اللوج
+    # لأن Cloud Run يجمع stdout فقط، لكن السكربت يحتاج قراءة الملف
+    os.makedirs(os.path.dirname(ACCESS_LOG_PATH), exist_ok=True)
+    log_file = open(ACCESS_LOG_PATH, "a")
+    err_file = open("/var/log/xray/error.log", "a")
     subprocess.Popen(
-        ["/usr/local/bin/xray", "run", "-config", XRAY_CONFIG_PATH]
+        ["/usr/local/bin/xray", "run", "-config", XRAY_CONFIG_PATH],
+        stdout=log_file,
+        stderr=err_file,
     )
     log("Xray restarted.")
 
