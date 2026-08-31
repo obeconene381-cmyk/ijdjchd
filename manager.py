@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import time
 import redis
@@ -11,13 +12,28 @@ REDIS_URL = os.environ.get(
 XRAY_CONFIG_PATH = "/usr/local/etc/xray/config.json"
 REDIS_USERS_KEY = "users:data"
 
+# ==============================================================================
+# إعدادات منع مشاركة الحساب: IP واحد فقط لكل UUID
+# ==============================================================================
+ACCESS_LOG_PATH = "/var/log/xray/access.log"
+XRAY_API_SERVER = "127.0.0.1:10085"
+XRAY_INBOUND_TAG = "vless-inbound"
+
+# كل كم ثانية نفحص اللوج
+IP_CHECK_INTERVAL = 1.0
+# كم ثانية نعتبر بعدها أن IP القديم انتهى (إذا لم يظهر في لوج القبول)
+IP_EXPIRY_SECONDS = 60
+# عدد البايتات التي نقرأها من اللوج كل دورة
+LOG_READ_CHUNK = 8192
+# مدة حظر الـ UUID عند اكتشاف مشاركة حساب (IP ثاني على نفس الـ UUID)
+BLOCK_DURATION = 15  # ثانية
+
 
 def log(msg):
     print(f"[MANAGER] {msg}", flush=True)
 
 
 try:
-    # تفعيل decode_responses=True لضمان قراءة النصوص مباشرة
     r = redis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
     r.ping()
     log("✅ Connected to Redis.")
@@ -26,7 +42,7 @@ except Exception as e:
     r = None
 
 # ==============================================================================
-# كود Lua الخصم الذري: يخصم البايتات فقط داخل Redis دون المساس بالنقاط أو الحقول الأخرى
+# كود Lua الخصم الذري
 # ==============================================================================
 DEDUCT_BYTES_LUA = """
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -51,7 +67,6 @@ deduct_script = r.register_script(DEDUCT_BYTES_LUA) if r else None
 
 
 def atomic_deduct_user_bytes(email, bytes_used):
-    """خصم استهلاك الترافيك أتمياً في Redis دون مسح النقاط أو تعديلات البوت"""
     if not deduct_script:
         return -1
     try:
@@ -84,6 +99,202 @@ def get_all_users():
         return {}
 
 
+# ==============================================================================
+# دوال إدارة المستخدمين عبر Xray API (إضافة/حذف بدون إعادة تشغيل)
+# ==============================================================================
+# صيغة ملف الـ JSON الذي يتوقعه أمر adu:
+# {
+#   "inbounds": [{
+#     "tag": "vless-inbound",
+#     "protocol": "vless",
+#     "settings": {
+#       "decryption": "none",
+#       "clients": [{ "id": "<uuid>", "email": "<email>" }]
+#     }
+#   }]
+# }
+def xray_api_add_user(email, uuid):
+    """يضيف مستخدم عبر Xray API دون إعادة تشغيل"""
+    user_config = {
+        "inbounds": [
+            {
+                "tag": XRAY_INBOUND_TAG,
+                "protocol": "vless",
+                "settings": {
+                    "decryption": "none",
+                    "clients": [{"id": uuid, "email": email}],
+                },
+            }
+        ]
+    }
+    tmp = f"/tmp/xray_add_{int(time.time()*1000)}.json"
+    with open(tmp, "w") as f:
+        json.dump(user_config, f)
+    try:
+        result = subprocess.run(
+            [
+                "/usr/local/bin/xray", "api", "adu",
+                f"--server={XRAY_API_SERVER}",
+                tmp,
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        os.unlink(tmp)
+        if result.returncode == 0:
+            return True
+        else:
+            log(f"❌ xray adu failed: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        log(f"❌ xray adu exception: {e}")
+        return False
+
+
+def xray_api_remove_user(email):
+    """يحذف مستخدم عبر Xray API — هذا يقطع كل اتصالاته فوراً"""
+    try:
+        result = subprocess.run(
+            [
+                "/usr/local/bin/xray", "api", "rmu",
+                f"--server={XRAY_API_SERVER}",
+                f"-tag={XRAY_INBOUND_TAG}",
+                email,
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return True
+        else:
+            log(f"❌ xray rmu failed: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        log(f"❌ xray rmu exception: {e}")
+        return False
+
+
+def kick_and_block_user(email):
+    """
+    يقطع كل اتصالات المستخدم فوراً ويحظر الـ UUID لمدة BLOCK_DURATION ثانية.
+    1) حذف المستخدم (rmu) — يقطع كل اتصالاته فوراً (IP القديم والجديد)
+    2) لا يتم إعادة إضافته الآن — يبقى محظوراً
+    3) إعادة الإضافة تتم تلقائياً بعد انتهاء مدة الحظر في اللوب الرئيسي
+    """
+    users = get_all_users()
+    if email not in users:
+        log(f"⚠️ Cannot kick {email}: not found in Redis")
+        return False
+    uuid = users[email].get("uuid")
+    if not uuid:
+        log(f"⚠️ Cannot kick {email}: no UUID")
+        return False
+
+    log(f"🔌 Kicking {email} (rmu) — disconnecting ALL IPs...")
+    if not xray_api_remove_user(email):
+        return False
+    log(f"⏳ {email} is now BLOCKED for {BLOCK_DURATION} seconds.")
+    return True
+
+
+def unblock_user(email):
+    """يعيد تفعيل المستخدم بعد انتهاء مدة الحظر"""
+    users = get_all_users()
+    if email not in users:
+        log(f"⚠️ Cannot unblock {email}: not found in Redis")
+        return False
+    uuid = users[email].get("uuid")
+    if not uuid:
+        log(f"⚠️ Cannot unblock {email}: no UUID")
+        return False
+
+    # تأكد أولاً أن المستخدم ليس مضافاً بالفعل
+    log(f"🔄 Unblocking {email} (adu) — re-adding to allow connections...")
+    if not xray_api_add_user(email, uuid):
+        log(f"❌ Failed to re-add {email} after block!")
+        return False
+    log(f"✅ {email} unblocked — connections allowed again.")
+    return True
+
+
+# ==============================================================================
+# مراقب اللوج: IP واحد فقط لكل UUID
+# ==============================================================================
+# الريجيكس يطابق سطر اللوج:
+# 2026/08/19 18:48:49.713692 from 129.45.83.252:0 accepted tcp:57.144.204.196:443 [vless-inbound >> direct] email: tester@vpn.local
+LOG_RE = re.compile(
+    r"from\s+(\d{1,3}(?:\.\d{1,3}){3}):"   # المصدر IP
+    r"\d+\s+"                                 # المنفذ المصدر (نتجاهله)
+    r"accepted\b.*?"                          # "accepted ... "
+    r"email:\s*(\S+)"                         # البريد
+)
+
+
+def tail_access_log():
+    """مولّد يقرأ اللوج بشكل تزايدي مثل tail -f"""
+    # نتأكد من وجود الملف
+    os.makedirs(os.path.dirname(ACCESS_LOG_PATH), exist_ok=True)
+    open(ACCESS_LOG_PATH, "a").close()
+
+    # نبدأ من آخر حجم معروف للملف
+    # (نتتبع الإزاحة في الذاكرة)
+    inode = None
+    offset = 0
+
+    # إذا الملف موجود بالفعل، نبدأ من آخر موضع
+    try:
+        offset = os.path.getsize(ACCESS_LOG_PATH)
+        inode = os.stat(ACCESS_LOG_PATH).st_ino
+    except OSError:
+        offset = 0
+
+    while True:
+        try:
+            current_inode = os.stat(ACCESS_LOG_PATH).st_ino
+        except OSError:
+            yield ""
+            time.sleep(0.3)
+            continue
+
+        # إذا تغيّر الـ inode (تدوير اللوج)، نبدأ من البداية
+        if inode is None:
+            inode = current_inode
+            offset = 0
+        elif inode != current_inode:
+            inode = current_inode
+            offset = 0
+
+        try:
+            with open(ACCESS_LOG_PATH, "r") as f:
+                f.seek(offset)
+                chunk = f.read(LOG_READ_CHUNK)
+                new_offset = f.tell()
+                if new_offset > offset:
+                    offset = new_offset
+                    yield chunk
+                else:
+                    # لا يوجد جديد
+                    yield ""
+        except OSError:
+            yield ""
+            time.sleep(0.3)
+
+
+def extract_ip_email_pairs(text):
+    """يستخرج أزواج (ip, email) من نص اللوج"""
+    pairs = []
+    for m in LOG_RE.finditer(text):
+        ip = m.group(1)
+        email = m.group(2).rstrip(",")
+        pairs.append((ip, email))
+    return pairs
+
+
+# ==============================================================================
+# إعادة بناء إعدادات Xray
+# ==============================================================================
 def restart_xray(users):
     config = {
         "log": {
@@ -176,6 +387,9 @@ def get_user_traffic():
         return None
 
 
+# ==============================================================================
+# نقطة الانطلاق
+# ==============================================================================
 os.makedirs("/var/log/xray", exist_ok=True)
 open("/var/log/xray/access.log", "a").close()
 users = get_all_users()
@@ -196,7 +410,21 @@ last_active = {e for e, d in users.items() if d.get("quota_bytes", 0) > 0}
 last_sync_time = time.time()
 last_quota_check = time.time()
 
+# ==============================================================================
+# حالة منع مشاركة الحساب
+# ==============================================================================
+# email -> {"ip": "x.x.x.x", "first_seen": timestamp, "last_seen": timestamp}
+active_ips = {}
+# email -> timestamp متى ينتهي الحظر (None = غير محظور)
+blocked_users = {}  # email -> unblock_at_timestamp
+last_ip_check = time.time()
+
+# نبدأ بقراءة اللوج من البداية لمسح الحالة الحالية
+log_gen = tail_access_log()
+
+
 while True:
+    # --- 1) فحص الحصة (الكوتا) ---
     if time.time() - last_quota_check >= 3:
         current_stats = get_user_traffic()
         if current_stats is not None:
@@ -208,7 +436,6 @@ while True:
                     used = cur
 
                 if used > 0:
-                    # الخصم الأتمي في Redis فوراً بدلاً من حفظ كائن JSON الكامل
                     new_quota = atomic_deduct_user_bytes(email, used)
 
                     if new_quota >= 0:
@@ -216,18 +443,15 @@ while True:
                             f"📉 {email}: -{used} bytes, remaining {new_quota} bytes"
                         )
 
-                        # تحديث النسخة المؤقتة محلياً فقط للفحص
                         if email in users:
                             users[email]["quota_bytes"] = new_quota
 
                         if new_quota <= 0:
-                            subprocess.run(
-                                f'/usr/local/bin/xray api rmu --server=127.0.0.1:10085 -tag="vless-inbound" "{email}"',
-                                shell=True,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
+                            xray_api_remove_user(email)
                             log(f"🚫 Quota finished: {email}")
+                            # نظّف حالة IP لهذا المستخدم
+                            if email in active_ips:
+                                del active_ips[email]
 
             last_stats = current_stats
         else:
@@ -235,6 +459,7 @@ while True:
 
         last_quota_check = time.time()
 
+    # --- 2) مزامنة المستخدمين مع Redis ---
     if time.time() - last_sync_time >= 20:
         try:
             users = get_all_users()
@@ -255,5 +480,83 @@ while True:
             last_sync_time = time.time()
         except Exception as e:
             log(f"❌ Sync error: {e}")
+
+    # --- 3) فك الحظر عن المستخدمين المحظورين بعد انتهاء المدة ---
+    now = time.time()
+    for email, unblock_at in list(blocked_users.items()):
+        if now >= unblock_at:
+            unblock_user(email)
+            del blocked_users[email]
+            # امسح حالة IP حتى يُسجَّل من جديد عند إعادة الاتصال
+            if email in active_ips:
+                del active_ips[email]
+
+    # --- 4) منع مشاركة الحساب: IP واحد فقط لكل UUID ---
+    if now - last_ip_check >= IP_CHECK_INTERVAL:
+        # اقرأ أي أسطر جديدة في اللوج
+        new_log_text = ""
+        try:
+            new_log_text = next(log_gen)
+        except StopIteration:
+            log_gen = tail_access_log()
+            new_log_text = ""
+
+        if new_log_text:
+            pairs = extract_ip_email_pairs(new_log_text)
+            for ip, email in pairs:
+                # هل المستخدم معروف ولديه كوتا؟
+                if email not in users:
+                    continue
+                if users[email].get("quota_bytes", 0) <= 0:
+                    continue
+
+                entry = active_ips.get(email)
+
+                if entry is None:
+                    # أول اتصال لهذا المستخدم
+                    active_ips[email] = {
+                        "ip": ip,
+                        "first_seen": now,
+                        "last_seen": now,
+                    }
+                    log(f"🟢 {email} connected from {ip}")
+
+                elif entry["ip"] == ip:
+                    # نفس IP — حدّث آخر ظهور
+                    entry["last_seen"] = now
+
+                else:
+                    # IP مختلف! هذا هو سيناريو مشاركة الحساب
+                    old_ip = entry["ip"]
+                    log(
+                        f"🚨 DUPLICATE IP DETECTED: {email} "
+                        f"was on {old_ip}, now connecting from {ip}"
+                    )
+
+                    # اقطع الاتصال فوراً واحظر الـ UUID لمدة BLOCK_DURATION ثانية
+                    if kick_and_block_user(email):
+                        blocked_users[email] = now + BLOCK_DURATION
+                        # امسح حالة IP — الـ UUID محظور الآن
+                        if email in active_ips:
+                            del active_ips[email]
+                        log(
+                            f"🚫 {email}: connection CUT, UUID blocked "
+                            f"for {BLOCK_DURATION}s (was {old_ip}, tried {ip})"
+                        )
+                    else:
+                        log(
+                            f"❌ Failed to kick {email}, keeping old IP {old_ip}"
+                        )
+
+        # نظّف IPs المنتهية (لم تظهر منذ IP_EXPIRY_SECONDS)
+        expired = []
+        for email, entry in list(active_ips.items()):
+            if now - entry["last_seen"] > IP_EXPIRY_SECONDS:
+                expired.append((email, entry["ip"]))
+                del active_ips[email]
+        for email, old_ip in expired:
+            log(f"⏰ {email} IP {old_ip} expired (no activity)")
+
+        last_ip_check = now
 
     time.sleep(0.5)
