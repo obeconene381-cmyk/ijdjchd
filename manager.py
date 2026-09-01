@@ -353,6 +353,11 @@ def unblock_worker():
 
             users = get_all_users()
             for email in to_unblock:
+                # إعادة التحقق من عدم إعادة الحظر أثناء الفترة الانتقالية
+                with blocked_lock:
+                    if now < blocked_users.get(email, 0):
+                        continue  # تم حظره مرة أخرى، تجاوز
+
                 user = users.get(email)
                 if not user or not user_is_active(user):
                     continue
@@ -406,11 +411,17 @@ def access_log_tailer():
 # ==============================================================================
 # بناء وتشغيل Xray
 # ==============================================================================
-def build_config(users):
+def build_config(users, blocked_emails=None):
+    """بناء الكونفيغ مع استبعاد المستخدمين المحظورين مؤقتاً."""
+    if blocked_emails is None:
+        blocked_emails = set()
+
     clients = [
         {"id": data["uuid"], "email": email}
         for email, data in users.items()
-        if user_is_active(data) and data.get("uuid")
+        if user_is_active(data)
+        and data.get("uuid")
+        and email not in blocked_emails
     ]
 
     return {
@@ -461,8 +472,9 @@ def build_config(users):
     }
 
 
-def restart_xray(users):
-    config = build_config(users)
+def restart_xray(users, blocked_emails=None):
+    """إعادة تشغيل Xray مع استبعاد المحظورين من الكونفيغ."""
+    config = build_config(users, blocked_emails)
     os.makedirs(os.path.dirname(XRAY_CONFIG_PATH), exist_ok=True)
 
     with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as config_file:
@@ -527,11 +539,17 @@ def get_user_traffic():
 # التشغيل
 # ==============================================================================
 def main():
+    # فشل الاتصال بـ Redis -> لا يمكن المتابعة بدون مسح المستخدمين
+    if redis_client is None:
+        log("FATAL: Redis is unavailable. Exiting to avoid wiping users.")
+        raise SystemExit(1)
+
     os.makedirs(os.path.dirname(XRAY_ACCESS_LOG), exist_ok=True)
     open(XRAY_ACCESS_LOG, "a").close()
 
     users = get_all_users()
-    if not restart_xray(users):
+    # في البداية لا يوجد محظورون
+    if not restart_xray(users, blocked_emails=set()):
         raise SystemExit("Invalid Xray configuration")
 
     time.sleep(2)
@@ -544,6 +562,7 @@ def main():
     last_sync = time.time()
     last_quota = time.time()
     last_ip_scan = time.time()
+    last_cleanup = time.time()
 
     threading.Thread(target=access_log_tailer, daemon=True).start()
     threading.Thread(target=unblock_worker, daemon=True).start()
@@ -579,6 +598,18 @@ def main():
                 last_stats = current_stats
             last_quota = now
 
+        # تنظيف ips_seen من المدخلات القديمة (كل 60 ثانية)
+        if now - last_cleanup >= 60:
+            with ips_lock:
+                for email in list(ips_seen):
+                    table = ips_seen[email]
+                    for ip in list(table):
+                        if now - table[ip] > IP_TTL_SECONDS:
+                            del table[ip]
+                    if not table:
+                        del ips_seen[email]
+            last_cleanup = now
+
         # مزامنة المستخدمين مع Redis.
         if now - last_sync >= 20:
             new_users = get_all_users()
@@ -586,6 +617,13 @@ def main():
                 email for email, data in new_users.items()
                 if user_is_active(data)
             }
+
+            # تجميع قائمة المحظورين حالياً لاستبعادهم من الكونفيغ
+            with blocked_lock:
+                blocked_now = {
+                    email for email, unblock_at in blocked_users.items()
+                    if now < unblock_at
+                }
 
             # إعادة التشغيل عند الإضافة أو الحذف أو تغيير UUID.
             old_signature = {
@@ -599,7 +637,7 @@ def main():
 
             if current_active != last_active or old_signature != new_signature:
                 users = new_users
-                if restart_xray(users):
+                if restart_xray(users, blocked_emails=blocked_now):
                     time.sleep(1)
                     last_stats = get_user_traffic() or last_stats
             else:
@@ -616,7 +654,7 @@ def main():
                     continue
 
                 with blocked_lock:
-                    if email in blocked_users:
+                    if now < blocked_users.get(email, 0):
                         continue
 
                 real_ips = [
