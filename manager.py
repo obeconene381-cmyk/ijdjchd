@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Xray User Manager + Anti Account-Sharing + Telegram Notifications
+Xray User Manager + Anti Account-Sharing + PROXY protocol proxy
 IP واحد فقط لكل UUID
 
-مهم:
-- adu/rmu يحتاجان إصدار Xray حديثاً يدعم هذه الأوامر.
-- acceptProxyProtocol يجب أن يكون True فقط إذا كان Xray يستقبل
-  PROXY protocol فعلياً من L4 proxy/stream proxy.
+المتغيرات المهمة:
+- XRAY_ACCEPT_PROXY_PROTOCOL : يجب أن تكون true لأن الوكيل الوسيط يرسل PROXY protocol.
+- XRAY_WS_PATH : مسار WebSocket الذي ستستخدمه في الـ VLESS.
 """
 
 import ipaddress
@@ -22,6 +21,7 @@ from collections import defaultdict
 from urllib import request, parse
 
 import redis
+import proxy  # استيراد الوكيل الذي يمرر IP الحقيقي
 
 # ==============================================================================
 # الإعدادات
@@ -39,10 +39,12 @@ REDIS_USERS_KEY = "users:data"
 
 XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
+XRAY_LISTEN_PORT = int(os.environ.get("XRAY_BACKEND_PORT", "5000"))
+XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
 IP_CHECK_INTERVAL = 2.0
 BLOCK_DURATION = 30
-IP_TTL_SECONDS = 300  # زيادة إلى 5 دقائق
+IP_TTL_SECONDS = 300  # 5 دقائق لتذكر العناوين
 
 # إعدادات تيليجرام
 TELEGRAM_BOT_TOKEN = os.environ.get(
@@ -51,10 +53,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get(
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
-# اجعله True فقط مع TCP/L4 proxy يرسل PROXY protocol.
-# مع Nginx HTTP/WebSocket أو Cloud Run اتركه False.
+# مع الوكيل الوسيط يجب أن يكون true
 ACCEPT_PROXY_PROTOCOL = os.environ.get(
-    "XRAY_ACCEPT_PROXY_PROTOCOL", "false"
+    "XRAY_ACCEPT_PROXY_PROTOCOL", "true"
 ).lower() in {"1", "true", "yes", "on"}
 
 
@@ -186,7 +187,7 @@ def run_xray_api(args):
 
 
 def xray_api_add_user(email, uuid):
-    """إضافة مستخدم باستخدام صيغة adu الحديثة: ملف يحوي inbounds."""
+    """إضافة مستخدم باستخدام صيغة adu الحديثة."""
     user_config = {
         "inbounds": [
             {
@@ -235,7 +236,7 @@ def xray_api_add_user(email, uuid):
 
 
 def xray_api_remove_user(email):
-    """حذف المستخدم من inbound، وبالتالي قطع اتصالاته الحالية."""
+    """حذف المستخدم من inbound وقطع اتصالاته."""
     try:
         result = run_xray_api(
             [
@@ -344,7 +345,7 @@ def handle_new_connection(email, ip):
         f"ACCOUNT SHARING: {email} has {len(distinct_ips)} IPs: "
         f"{', '.join(distinct_ips)}"
     )
-    # إرسال إشعار تيليجرام
+    # إشعار تيليجرام
     send_telegram(
         f"🚨 <b>مشاركة حساب مكتشفة</b>\n"
         f"👤 المستخدم: <code>{email}</code>\n"
@@ -357,7 +358,6 @@ def handle_new_connection(email, ip):
 
 
 def kick_and_block(email):
-    # منع تنفيذ rmu عدة مرات بسبب وصول عدة أسطر متتالية من access.log.
     now = time.time()
     with blocked_lock:
         if now < blocked_users.get(email, 0):
@@ -371,7 +371,7 @@ def kick_and_block(email):
     log(f"Removing {email} and cutting all connections")
     success = xray_api_remove_user(email)
     if not success:
-        # محاولة احتياطية باستخدام الصيغة القديمة
+        # محاولة احتياطية
         try:
             subprocess.run(
                 f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} '
@@ -412,10 +412,9 @@ def unblock_worker():
 
             users = get_all_users()
             for email in to_unblock:
-                # إعادة التحقق من عدم إعادة الحظر أثناء الفترة الانتقالية
                 with blocked_lock:
                     if now < blocked_users.get(email, 0):
-                        continue  # تم حظره مرة أخرى، تجاوز
+                        continue
 
                 user = users.get(email)
                 if not user or not user_is_active(user):
@@ -476,7 +475,6 @@ def access_log_tailer():
 # بناء وتشغيل Xray
 # ==============================================================================
 def build_config(users, blocked_emails=None):
-    """بناء الكونفيغ مع استبعاد المستخدمين المحظورين مؤقتاً."""
     if blocked_emails is None:
         blocked_emails = set()
 
@@ -512,7 +510,7 @@ def build_config(users, blocked_emails=None):
         "inbounds": [
             {
                 "listen": "127.0.0.1",
-                "port": 5000,
+                "port": XRAY_LISTEN_PORT,
                 "protocol": "vless",
                 "tag": XRAY_INBOUND_TAG,
                 "settings": {
@@ -522,7 +520,7 @@ def build_config(users, blocked_emails=None):
                 "streamSettings": {
                     "network": "ws",
                     "security": "none",
-                    "wsSettings": {"path": "/@pycorav1"},
+                    "wsSettings": {"path": XRAY_WS_PATH},
                     "sockopt": {
                         "acceptProxyProtocol": ACCEPT_PROXY_PROTOCOL
                     },
@@ -537,7 +535,6 @@ def build_config(users, blocked_emails=None):
 
 
 def restart_xray(users, blocked_emails=None):
-    """إعادة تشغيل Xray مع استبعاد المحظورين من الكونفيغ."""
     config = build_config(users, blocked_emails)
     os.makedirs(os.path.dirname(XRAY_CONFIG_PATH), exist_ok=True)
 
@@ -603,7 +600,6 @@ def get_user_traffic():
 # التشغيل
 # ==============================================================================
 def main():
-    # فشل الاتصال بـ Redis -> لا يمكن المتابعة بدون مسح المستخدمين
     if redis_client is None:
         log("FATAL: Redis is unavailable. Exiting to avoid wiping users.")
         send_telegram("⚠️ فشل الاتصال بـ Redis. تم إيقاف المدير.")
@@ -613,12 +609,21 @@ def main():
     open(XRAY_ACCESS_LOG, "a").close()
 
     users = get_all_users()
-    # في البداية لا يوجد محظورون
     if not restart_xray(users, blocked_emails=set()):
         raise SystemExit("Invalid Xray configuration")
 
     time.sleep(2)
     last_stats = get_user_traffic() or {}
+
+    # بدء تشغيل الوكيل الوسيط الذي يمرر IP الحقيقي عبر PROXY protocol
+    try:
+        proxy_thread = threading.Thread(target=proxy.main, daemon=True)
+        proxy_thread.start()
+        log("Proxy started.")
+    except Exception as exc:
+        log(f"Failed to start proxy: {exc}")
+        send_telegram("❌ فشل تشغيل الوكيل الوسيط.")
+        raise SystemExit(1)
 
     last_active = {
         email for email, data in users.items()
@@ -634,7 +639,7 @@ def main():
 
     log(
         f"Started. active_users={len(last_active)}, "
-        f"proxy_protocol={ACCEPT_PROXY_PROTOCOL}"
+        f"proxy_protocol={ACCEPT_PROXY_PROTOCOL}, ws_path={XRAY_WS_PATH}"
     )
     send_telegram("🟢 تم تشغيل سكربت إدارة Xray بنجاح.")
 
@@ -669,7 +674,7 @@ def main():
                 last_stats = current_stats
             last_quota = now
 
-        # تنظيف ips_seen من المدخلات القديمة (كل 60 ثانية)
+        # تنظيف ips_seen من المدخلات القديمة
         if now - last_cleanup >= 60:
             with ips_lock:
                 for email in list(ips_seen):
@@ -689,14 +694,12 @@ def main():
                 if user_is_active(data)
             }
 
-            # تجميع قائمة المحظورين حالياً لاستبعادهم من الكونفيغ
             with blocked_lock:
                 blocked_now = {
                     email for email, unblock_at in blocked_users.items()
                     if now < unblock_at
                 }
 
-            # إعادة التشغيل عند الإضافة أو الحذف أو تغيير UUID.
             old_signature = {
                 (email, users[email].get("uuid"))
                 for email in last_active if email in users
@@ -717,7 +720,7 @@ def main():
             last_active = current_active
             last_sync = now
 
-        # فحص احتياطي عبر Xray API، إذا كان الأمر مدعوماً.
+        # فحص احتياطي عبر Xray API
         if now - last_ip_scan >= IP_CHECK_INTERVAL:
             online = get_online_users_ips()
             for email, ips in online.items():
