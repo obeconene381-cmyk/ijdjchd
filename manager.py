@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Xray User Manager + Anti Account-Sharing
+Xray User Manager + Anti Account-Sharing + Telegram Notifications
 IP واحد فقط لكل UUID
 
 مهم:
@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from urllib import request, parse
 
 import redis
 
@@ -41,7 +42,14 @@ XRAY_INBOUND_TAG = "vless-inbound"
 
 IP_CHECK_INTERVAL = 2.0
 BLOCK_DURATION = 30
-IP_TTL_SECONDS = 90
+IP_TTL_SECONDS = 300  # زيادة إلى 5 دقائق
+
+# إعدادات تيليجرام
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN",
+    "8812248294:AAHbQnTWwkkneggwN8G8yTg_1HyYoy95S5I"
+)
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
 # اجعله True فقط مع TCP/L4 proxy يرسل PROXY protocol.
 # مع Nginx HTTP/WebSocket أو Cloud Run اتركه False.
@@ -52,6 +60,26 @@ ACCEPT_PROXY_PROTOCOL = os.environ.get(
 
 def log(message):
     print(f"[MANAGER] {message}", flush=True)
+
+
+# ==============================================================================
+# إشعارات تيليجرام
+# ==============================================================================
+def send_telegram(text):
+    """إرسال رسالة إلى تيليجرام."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }).encode()
+        req = request.Request(url, data=data)
+        request.urlopen(req, timeout=5)
+    except Exception as exc:
+        log(f"Telegram notification failed: {exc}")
 
 
 # ==============================================================================
@@ -300,6 +328,7 @@ def handle_new_connection(email, ip):
 
     with ips_lock:
         table = ips_seen[email]
+        # إزالة السجلات القديمة
         for old_ip in list(table):
             if now - table[old_ip] > IP_TTL_SECONDS:
                 del table[old_ip]
@@ -314,6 +343,15 @@ def handle_new_connection(email, ip):
     log(
         f"ACCOUNT SHARING: {email} has {len(distinct_ips)} IPs: "
         f"{', '.join(distinct_ips)}"
+    )
+    # إرسال إشعار تيليجرام
+    send_telegram(
+        f"🚨 <b>مشاركة حساب مكتشفة</b>\n"
+        f"👤 المستخدم: <code>{email}</code>\n"
+        f"🌐 عدد العناوين: {len(distinct_ips)}\n"
+        f"📋 العناوين: {', '.join(distinct_ips)}\n"
+        f"⏱ الوقت: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"⛔ سيتم قطع الاتصال وحظر المستخدم."
     )
     kick_and_block(email)
 
@@ -331,12 +369,33 @@ def kick_and_block(email):
         return
 
     log(f"Removing {email} and cutting all connections")
-    xray_api_remove_user(email)
+    success = xray_api_remove_user(email)
+    if not success:
+        # محاولة احتياطية باستخدام الصيغة القديمة
+        try:
+            subprocess.run(
+                f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} '
+                f'-tag="{XRAY_INBOUND_TAG}" "{email}"',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            success = True
+        except Exception:
+            pass
 
     with ips_lock:
         ips_seen[email].clear()
 
-    log(f"Blocked {email} for {BLOCK_DURATION} seconds")
+    if success:
+        log(f"Blocked {email} for {BLOCK_DURATION} seconds")
+        send_telegram(
+            f"⛔ المستخدم <code>{email}</code> تم حظره مؤقتاً "
+            f"لمدة {BLOCK_DURATION} ثانية بسبب مشاركة الحساب."
+        )
+    else:
+        log(f"Failed to remove user {email}")
 
 
 def unblock_worker():
@@ -365,7 +424,12 @@ def unblock_worker():
                 uuid = user.get("uuid")
                 if uuid:
                     log(f"Unblocking {email}")
-                    xray_api_add_user(email, uuid)
+                    success = xray_api_add_user(email, uuid)
+                    if success:
+                        send_telegram(
+                            f"✅ المستخدم <code>{email}</code> تم فك حظره "
+                            f"وإعادة إضافته."
+                        )
         except Exception as exc:
             log(f"unblock worker error: {exc}")
 
@@ -542,6 +606,7 @@ def main():
     # فشل الاتصال بـ Redis -> لا يمكن المتابعة بدون مسح المستخدمين
     if redis_client is None:
         log("FATAL: Redis is unavailable. Exiting to avoid wiping users.")
+        send_telegram("⚠️ فشل الاتصال بـ Redis. تم إيقاف المدير.")
         raise SystemExit(1)
 
     os.makedirs(os.path.dirname(XRAY_ACCESS_LOG), exist_ok=True)
@@ -571,6 +636,7 @@ def main():
         f"Started. active_users={len(last_active)}, "
         f"proxy_protocol={ACCEPT_PROXY_PROTOCOL}"
     )
+    send_telegram("🟢 تم تشغيل سكربت إدارة Xray بنجاح.")
 
     while True:
         now = time.time()
@@ -594,6 +660,11 @@ def main():
                                 xray_api_remove_user(email)
                                 with ips_lock:
                                     ips_seen.pop(email, None)
+                                log(f"Quota finished: {email}")
+                                send_telegram(
+                                    f"🚫 المستخدم <code>{email}</code> انتهت "
+                                    f"كوتاه وتم قطعه."
+                                )
 
                 last_stats = current_stats
             last_quota = now
@@ -665,6 +736,12 @@ def main():
                     log(
                         f"API detected multiple IPs for {email}: "
                         f"{', '.join(real_ips)}"
+                    )
+                    send_telegram(
+                        f"🚨 <b>مشاركة حساب مكتشفة عبر API</b>\n"
+                        f"👤 المستخدم: <code>{email}</code>\n"
+                        f"🌐 عدد العناوين: {len(set(real_ips))}\n"
+                        f"📋 العناوين: {', '.join(real_ips)}"
                     )
                     kick_and_block(email)
 
