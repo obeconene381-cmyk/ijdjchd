@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-TCP Proxy with PROXY protocol header injection for Xray.
-Listens on 0.0.0.0:8080 (Cloud Run PORT), extracts client IP from
-X-Forwarded-For, then forwards to Xray (127.0.0.1:5000) with PROXY protocol.
-"""
+"""TCP Proxy with PROXY protocol v1 injection for Xray-core."""
+
+import ipaddress
 import os
 import socket
 import socketserver
 import threading
-import sys
 
 LISTEN_HOST = os.environ.get("PROXY_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("PORT", "8080"))
 BACKEND_HOST = os.environ.get("XRAY_BACKEND_HOST", "127.0.0.1")
 BACKEND_PORT = int(os.environ.get("XRAY_BACKEND_PORT", "5000"))
-WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
+WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1").rstrip("/")
+
 
 def log(msg):
     print(f"[PROXY] {msg}", flush=True)
 
 
 class ProxyHandler(socketserver.BaseRequestHandler):
+
     def handle(self):
         client = self.request
         client.settimeout(30)
@@ -29,11 +28,16 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             data = self._read_headers(client)
             if not data:
                 return
-            headers_str = data.decode('latin-1', errors='ignore')
+
+            headers_str = data.decode("latin-1", errors="ignore")
             method, path, _ = self._parse_request_line(headers_str)
             headers = self._parse_headers(headers_str)
 
-            if path != WS_PATH or method.upper() != 'GET':
+            # تنظيف المسار من أي معاملات مثل ?ed=2048
+            clean_path = path.split("?")[0].rstrip("/")
+
+            # التحقق من المسار والطلب
+            if clean_path != WS_PATH or method.upper() != "GET":
                 response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
                 client.sendall(response)
                 return
@@ -41,20 +45,29 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             client_ip = self._get_client_ip(headers, client)
             client_port = client.getpeername()[1]
 
+            # كشف نوع العنوان (IPv4 أو IPv6) لإنشاء ترويسة PROXY protocol قياسية
+            try:
+                ip_obj = ipaddress.ip_address(client_ip)
+                proto = "TCP6" if ip_obj.version == 6 else "TCP4"
+            except ValueError:
+                proto = "TCP4"
+
             backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             backend.settimeout(30)
             backend.connect((BACKEND_HOST, BACKEND_PORT))
 
-            # PROXY protocol header
-            proxy_line = f"PROXY TCP4 {client_ip} {BACKEND_HOST} {client_port} {BACKEND_PORT}\r\n".encode()
+            # حقن الترويسة القياسية لـ PROXY protocol v1
+            proxy_line = f"PROXY {proto} {client_ip} {BACKEND_HOST} {client_port} {BACKEND_PORT}\r\n".encode()
             backend.sendall(proxy_line)
             backend.sendall(data)
 
-            log(f"Proxying {client_ip} -> {BACKEND_HOST}:{BACKEND_PORT} path={path}")
-
             stop_event = threading.Event()
-            t1 = threading.Thread(target=self._relay, args=(client, backend, stop_event))
-            t2 = threading.Thread(target=self._relay, args=(backend, client, stop_event))
+            t1 = threading.Thread(
+                target=self._relay, args=(client, backend, stop_event)
+            )
+            t2 = threading.Thread(
+                target=self._relay, args=(backend, client, stop_event)
+            )
             t1.daemon = True
             t2.daemon = True
             t1.start()
@@ -63,7 +76,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             t2.join()
 
         except Exception as e:
-            log(f"Connection error: {e}")
+            log(f"Handler error: {e}")
         finally:
             client.close()
 
@@ -127,7 +140,7 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 def main():
     server = ThreadingTCPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
-    log(f"Listening on {LISTEN_HOST}:{LISTEN_PORT}, forwarding to {BACKEND_HOST}:{BACKEND_PORT} path={WS_PATH}")
+    log(f"Listening on {LISTEN_HOST}:{LISTEN_PORT}, backend at {BACKEND_PORT}")
     server.serve_forever()
 
 
