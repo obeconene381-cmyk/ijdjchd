@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 TCP Proxy with PROXY protocol header injection for Xray.
-Listens on 0.0.0.0:8080, reads HTTP headers to extract client IP from
-X-Forwarded-For, then sends PROXY protocol line before forwarding to Xray.
+Listens on 0.0.0.0:8080 (Cloud Run PORT), extracts client IP from
+X-Forwarded-For, then forwards to Xray (127.0.0.1:5000) with PROXY protocol.
 """
 import os
 import socket
 import socketserver
 import threading
+import sys
 
 LISTEN_HOST = os.environ.get("PROXY_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("PORT", "8080"))
@@ -33,12 +34,10 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             headers = self._parse_headers(headers_str)
 
             if path != WS_PATH or method.upper() != 'GET':
-                # Health check or any non-WS request
                 response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
                 client.sendall(response)
                 return
 
-            # WebSocket upgrade to Xray path
             client_ip = self._get_client_ip(headers, client)
             client_port = client.getpeername()[1]
 
@@ -49,12 +48,10 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             # PROXY protocol header
             proxy_line = f"PROXY TCP4 {client_ip} {BACKEND_HOST} {client_port} {BACKEND_PORT}\r\n".encode()
             backend.sendall(proxy_line)
-            # Send original HTTP request (including headers) to Xray
             backend.sendall(data)
 
             log(f"Proxying {client_ip} -> {BACKEND_HOST}:{BACKEND_PORT} path={path}")
 
-            # Relay in both directions
             stop_event = threading.Event()
             t1 = threading.Thread(target=self._relay, args=(client, backend, stop_event))
             t2 = threading.Thread(target=self._relay, args=(backend, client, stop_event))
@@ -101,11 +98,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
     def _get_client_ip(self, headers, client):
         xff = headers.get("x-forwarded-for", "")
         if xff:
-            # Cloud Run: first IP is the original client IP
             first_ip = xff.split(",")[0].strip()
             if first_ip:
                 return first_ip
-        # Fallback to direct client IP
         return client.getpeername()[0]
 
     def _relay(self, src, dst, stop_event):
