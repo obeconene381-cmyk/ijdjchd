@@ -14,15 +14,15 @@ from urllib import parse, request
 import redis
 
 # ==============================================================================
-# الإعدادات
+# الإعدادات (استخدام /tmp لتفادي مشاكل symlink stdout في Docker)
 # ==============================================================================
 REDIS_URL = os.environ.get(
     "REDIS_URL", "redis://:CoraNetRedis2026SecurePass@54.86.129.233:6379/0"
 )
 XRAY_BIN = "/usr/local/bin/xray"
 XRAY_CONFIG_PATH = "/usr/local/etc/xray/config.json"
-XRAY_ACCESS_LOG = "/var/log/xray/access.log"
-XRAY_ERROR_LOG = "/var/log/xray/error.log"
+XRAY_ACCESS_LOG = "/tmp/xray_access.log"
+XRAY_ERROR_LOG = "/tmp/xray_error.log"
 REDIS_USERS_KEY = "users:data"
 
 XRAY_API_SERVER = "127.0.0.1:10085"
@@ -37,7 +37,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get(
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
-# نمط يطابق سجل الدخول في Xray مع استخراج IP ومعرف الحساب بدقة
 ACCESS_LINE_RE = re.compile(
     r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
 )
@@ -192,8 +191,6 @@ def restart_xray(users, blocked_set=None):
 def xray_api_remove_user(user_id):
     cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
     res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if res.returncode != 0:
-        log(f"API rmu output: {res.stderr.strip() or res.stdout.strip()}")
     return res.returncode == 0
 
 
@@ -228,9 +225,9 @@ def xray_api_add_user(user_id, uuid):
 # ==============================================================================
 # كشف العناوين المتعددة (Anti Account-Sharing)
 # ==============================================================================
-ips_seen = defaultdict(dict)  # user_id -> {ip: timestamp}
+ips_seen = defaultdict(dict)
 ips_lock = threading.Lock()
-blocked_users = {}  # user_id -> unblock_timestamp
+blocked_users = {}
 blocked_lock = threading.Lock()
 
 
@@ -241,7 +238,6 @@ def kick_and_block(user_id, ips):
             return
         blocked_users[user_id] = now + BLOCK_DURATION
 
-    # قطع الاتصال فوراً
     xray_api_remove_user(user_id)
 
     with ips_lock:
@@ -277,37 +273,42 @@ def handle_new_connection(user_id, ip):
 
 
 def access_log_reader():
-    """قراءة مباشرة وسريعة للسجل بدون تأخير buffer"""
+    """قراءة مباشرة وسريعة لملف /tmp الحقيقي دون أي تعليق"""
+    # التأكد من وجود الملف كملف حقيقي
     while not os.path.exists(XRAY_ACCESS_LOG):
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-    log(f"Monitoring log: {XRAY_ACCESS_LOG}")
-    with open(XRAY_ACCESS_LOG, "r", encoding="utf-8", errors="ignore") as f:
-        f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
+    log(f"Monitoring log file: {XRAY_ACCESS_LOG}")
+    try:
+        with open(XRAY_ACCESS_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
 
-            if "accepted" not in line or "email:" not in line:
-                continue
+                if "accepted" not in line or "email:" not in line:
+                    continue
 
-            m = ACCESS_LINE_RE.search(line)
-            if not m:
-                continue
+                m = ACCESS_LINE_RE.search(line)
+                if not m:
+                    continue
 
-            ip = m.group("ip").strip("[]")
-            user_id = m.group("user_id")
+                ip = m.group("ip").strip("[]")
+                user_id = m.group("user_id")
 
-            if ip in ("127.0.0.1", "::1"):
-                continue
+                if ip in ("127.0.0.1", "::1"):
+                    continue
 
-            handle_new_connection(user_id, ip)
+                # طباعة السطر للـ Cloud Run Logs لكي تراه مباشرة
+                log(f"Accepted: {user_id} from IP: {ip}")
+                handle_new_connection(user_id, ip)
+    except Exception as exc:
+        log(f"access_log_reader crashed: {exc}")
 
 
 def unblock_worker():
-    """فك الحظر وإرجاع المستخدم فور انتهاء المدة"""
     while True:
         now = time.time()
         to_unblock = []
@@ -324,10 +325,8 @@ def unblock_worker():
                 if udata and udata.get("quota_bytes", 0) > 0:
                     uuid = udata.get("uuid")
                     if uuid:
-                        # محاولة الإضافة عبر API أولاً
                         success = xray_api_add_user(user_id, uuid)
                         if not success:
-                            # إعادة تشغيل سريعة كحل احتياطي لضمان عودة المستخدم
                             with blocked_lock:
                                 current_b = set(str(k) for k in blocked_users)
                             restart_xray(current_users, blocked_set=current_b)
@@ -371,12 +370,16 @@ def get_user_traffic():
 # التشغيل الرئيسي
 # ==============================================================================
 def main():
-    os.makedirs("/var/log/xray", exist_ok=True)
+    # تنظيف أي ملف قديم وضمان وجود ملف عادي في /tmp
+    if os.path.exists(XRAY_ACCESS_LOG):
+        try:
+            os.remove(XRAY_ACCESS_LOG)
+        except Exception:
+            pass
     open(XRAY_ACCESS_LOG, "a").close()
 
     try:
         import proxy
-
         threading.Thread(target=proxy.main, daemon=True).start()
         log("✅ Proxy started on port 8080.")
     except Exception as e:
@@ -399,7 +402,6 @@ def main():
     while True:
         now = time.time()
 
-        # خصم الكوتا كل 3 ثوانٍ
         if now - last_quota_check >= 3:
             current_stats = get_user_traffic()
             if current_stats is not None:
@@ -426,7 +428,6 @@ def main():
                 last_stats = current_stats
             last_quota_check = now
 
-        # مزامنة المستخدمين الجدد من Redis كل 20 ثانية
         if now - last_sync_time >= 20:
             try:
                 users = get_all_users()
