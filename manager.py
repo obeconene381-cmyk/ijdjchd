@@ -17,28 +17,29 @@ import redis
 # الإعدادات
 # ==============================================================================
 REDIS_URL = os.environ.get(
-    "REDIS_URL",
-    "redis://:CoraNetRedis2026SecurePass@54.86.129.233:6379/0",
+    "REDIS_URL", "redis://:CoraNetRedis2026SecurePass@54.86.129.233:6379/0"
 )
 XRAY_BIN = "/usr/local/bin/xray"
 XRAY_CONFIG_PATH = "/usr/local/etc/xray/config.json"
 XRAY_ACCESS_LOG = "/var/log/xray/access.log"
 XRAY_ERROR_LOG = "/var/log/xray/error.log"
 REDIS_USERS_KEY = "users:data"
+
 XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
+XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
-BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # مدة الحظر بالثواني
-IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "120"))  # صلاحية وجود الـ IP
+BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # ثواني الحظر
+IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "90"))  # نافذة التتبع
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", "8812248294:AAHbQnTWwkkneggwN8G8yTg_1HyYoy95S5I"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
-# تعبير نمطي صحيح يطابق سطر Xray الحقيقي بدقة
+# نمط يطابق بدقة سجل Xray الرسمي ويستخرج الآيبي ومعرف المستخدم (Telegram ID / Key)
 ACCESS_LINE_RE = re.compile(
-    r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<email>\S+)"
+    r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
 )
 
 
@@ -61,7 +62,7 @@ def send_telegram(text):
 
 
 # ==============================================================================
-# اتصال Redis و Lua Script
+# اتصال Redis وخصم الكوتا (Lua Script المجرّب)
 # ==============================================================================
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
@@ -88,17 +89,17 @@ return -1
 deduct_script = r.register_script(DEDUCT_BYTES_LUA) if r else None
 
 
-def atomic_deduct_user_bytes(email, bytes_used):
+def atomic_deduct_user_bytes(user_id, bytes_used):
     if not deduct_script:
         return -1
     try:
         return int(
             deduct_script(
-                keys=[REDIS_USERS_KEY], args=[str(email), str(bytes_used)]
+                keys=[REDIS_USERS_KEY], args=[str(user_id), str(bytes_used)]
             )
         )
     except Exception as e:
-        log(f"❌ Error in atomic deduct for {email}: {e}")
+        log(f"❌ Deduct error for {user_id}: {e}")
         return -1
 
 
@@ -107,26 +108,25 @@ def get_all_users():
         return {}
     try:
         raw = r.hgetall(REDIS_USERS_KEY)
-        users = {}
-        for email, data_str in raw.items():
-            users[email] = json.loads(data_str)
-        return users
+        return {k: json.loads(v) for k, v in raw.items()}
     except Exception as e:
         log(f"❌ Redis read error: {e}")
         return {}
 
 
 # ==============================================================================
-# إعداد وبناء Xray (استرجاع إعداداتك الأصلية مع تفعيل PROXY protocol)
+# إدارة Xray (نفس البنية المجرّبة لديك مع تفعيل PROXY protocol)
 # ==============================================================================
 def restart_xray(users, blocked_set=None):
     if blocked_set is None:
         blocked_set = set()
 
     clients = [
-        {"id": data["uuid"], "email": email}
-        for email, data in users.items()
-        if data.get("quota_bytes", 0) > 0 and email not in blocked_set
+        {"id": data["uuid"], "email": str(user_id)}
+        for user_id, data in users.items()
+        if data.get("quota_bytes", 0) > 0
+        and data.get("uuid")
+        and str(user_id) not in blocked_set
     ]
 
     config = {
@@ -152,7 +152,7 @@ def restart_xray(users, blocked_set=None):
                 "streamSettings": {
                     "network": "ws",
                     "security": "none",
-                    "wsSettings": {"path": "/@pycorav1"},
+                    "wsSettings": {"path": XRAY_WS_PATH},
                     "sockopt": {"acceptProxyProtocol": True},
                 },
             },
@@ -189,26 +189,23 @@ def restart_xray(users, blocked_set=None):
     log("Xray restarted.")
 
 
-def xray_api_remove_user(email):
-    cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{email}"'
+def xray_api_remove_user(user_id):
+    cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
     res = subprocess.run(
-        cmd,
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     return res.returncode == 0
 
 
-def xray_api_add_user(email, uuid):
-    user_config = {
+def xray_api_add_user(user_id, uuid):
+    payload = {
         "inbounds": [
             {
                 "tag": XRAY_INBOUND_TAG,
                 "protocol": "vless",
                 "settings": {
                     "decryption": "none",
-                    "clients": [{"id": uuid, "email": email}],
+                    "clients": [{"id": uuid, "email": str(user_id)}],
                 },
             }
         ]
@@ -216,7 +213,7 @@ def xray_api_add_user(email, uuid):
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as f:
-        json.dump(user_config, f)
+        json.dump(payload, f)
         tmp = f.name
     try:
         cmd = [XRAY_BIN, "api", "adu", f"--server={XRAY_API_SERVER}", tmp]
@@ -228,46 +225,45 @@ def xray_api_add_user(email, uuid):
 
 
 # ==============================================================================
-# كشف العناوين المتعددة (Anti Account-Sharing)
+# كشف العناوين المتعددة وفصل الحساب
 # ==============================================================================
-ips_seen = defaultdict(dict)  # email -> {ip: timestamp}
+ips_seen = defaultdict(dict)  # user_id -> {ip: timestamp}
 ips_lock = threading.Lock()
-blocked_users = {}  # email -> unblock_timestamp
+blocked_users = {}  # user_id -> unblock_timestamp
 blocked_lock = threading.Lock()
 
 
-def kick_and_block(email, ips):
+def kick_and_block(user_id, ips):
     now = time.time()
     with blocked_lock:
-        if now < blocked_users.get(email, 0):
+        if now < blocked_users.get(user_id, 0):
             return
-        blocked_users[email] = now + BLOCK_DURATION
+        blocked_users[user_id] = now + BLOCK_DURATION
 
-    # قطع الاتصال مباشرة بنفس الأمر المجرّب لديك
-    xray_api_remove_user(email)
+    # طرد فوري عبر API
+    xray_api_remove_user(user_id)
 
     with ips_lock:
-        ips_seen.pop(email, None)
+        ips_seen.pop(user_id, None)
 
-    log(f"🚨 Kicked and blocked {email} for {BLOCK_DURATION}s. IPs: {ips}")
+    log(f"🚨 Sharing detected! Kicked: {user_id} | IPs: {ips}")
     send_telegram(
         f"🚨 <b>تم كشف مشاركة الحساب</b>\n"
-        f"👤 المستخدم: <code>{email}</code>\n"
+        f"👤 المعرف (ID): <code>{user_id}</code>\n"
         f"🌐 عدد الأجهزة: {len(ips)}\n"
         f"📋 العناوين: <code>{', '.join(ips)}</code>\n"
         f"⛔ تم قطع الاتصال والحظر لمدة {BLOCK_DURATION} ثانية."
     )
 
 
-def handle_new_connection(email, ip):
+def handle_new_connection(user_id, ip):
     now = time.time()
     with blocked_lock:
-        if now < blocked_users.get(email, 0):
+        if now < blocked_users.get(user_id, 0):
             return
 
     with ips_lock:
-        table = ips_seen[email]
-        # حذف العناوين التي تجاوزت مدة الـ TTL
+        table = ips_seen[user_id]
         for old_ip in list(table.keys()):
             if now - table[old_ip] > IP_TTL_SECONDS:
                 del table[old_ip]
@@ -275,9 +271,8 @@ def handle_new_connection(email, ip):
         table[ip] = now
         active_ips = list(table.keys())
 
-    # إذا تم تسجيل أكثر من آيبي واحد مختلف خلال نافذة الـ TTL
     if len(active_ips) > 1:
-        kick_and_block(email, active_ips)
+        kick_and_block(user_id, active_ips)
 
 
 def access_log_reader():
@@ -285,7 +280,7 @@ def access_log_reader():
     while not os.path.exists(XRAY_ACCESS_LOG):
         time.sleep(0.5)
 
-    log(f"Monitoring {XRAY_ACCESS_LOG} for multi-IP connections...")
+    log(f"Monitoring log: {XRAY_ACCESS_LOG}")
     with open(XRAY_ACCESS_LOG, "r", encoding="utf-8", errors="ignore") as f:
         f.seek(0, os.SEEK_END)
         while True:
@@ -302,35 +297,35 @@ def access_log_reader():
                 continue
 
             ip = m.group("ip").strip("[]")
-            email = m.group("email")
+            user_id = m.group("user_id")
 
             if ip in ("127.0.0.1", "::1"):
                 continue
 
-            handle_new_connection(email, ip)
+            handle_new_connection(user_id, ip)
 
 
 def unblock_worker():
-    """إرجاع المستخدم بعد انقضاء مدة الحظر المؤقت"""
+    """فك الحظر وإرجاع المستخدم فور انتهاء المدة"""
     while True:
         now = time.time()
         to_unblock = []
         with blocked_lock:
-            for email, unblock_time in list(blocked_users.items()):
+            for user_id, unblock_time in list(blocked_users.items()):
                 if now >= unblock_time:
-                    to_unblock.append(email)
-                    del blocked_users[email]
+                    to_unblock.append(user_id)
+                    del blocked_users[user_id]
 
         if to_unblock:
             current_users = get_all_users()
-            for email in to_unblock:
-                user = current_users.get(email)
-                if user and user.get("quota_bytes", 0) > 0:
-                    uuid = user.get("uuid")
-                    if uuid and xray_api_add_user(email, uuid):
-                        log(f"✅ Unblocked: {email}")
+            for user_id in to_unblock:
+                udata = current_users.get(user_id)
+                if udata and udata.get("quota_bytes", 0) > 0:
+                    uuid = udata.get("uuid")
+                    if uuid and xray_api_add_user(user_id, uuid):
+                        log(f"✅ Unblocked: {user_id}")
                         send_telegram(
-                            f"✅ انتهى الحظر المؤقت للمستخدم <code>{email}</code> وتمت إعادته للخدمة."
+                            f"✅ انتهى الحظر المؤقت وتمت إعادة تفعيل الحساب:\n<code>{user_id}</code>"
                         )
         time.sleep(2)
 
@@ -357,8 +352,8 @@ def get_user_traffic():
             name = item["name"]
             val = int(item["value"])
             if "user>>>" in name and ">>>traffic>>>" in name:
-                email = name.split(">>>")[1]
-                traffic[email] = traffic.get(email, 0) + val
+                u_id = name.split(">>>")[1]
+                traffic[u_id] = traffic.get(u_id, 0) + val
         return traffic
     except Exception:
         return None
@@ -371,12 +366,12 @@ def main():
     os.makedirs("/var/log/xray", exist_ok=True)
     open(XRAY_ACCESS_LOG, "a").close()
 
-    # تشغيل proxy.py في خلفية نفس الحاوية
+    # تشغيل الوكيل
     try:
         import proxy
 
         threading.Thread(target=proxy.main, daemon=True).start()
-        log("✅ TCP Proxy started on port 8080.")
+        log("✅ Proxy started on port 8080.")
     except Exception as e:
         log(f"Proxy start error: {e}")
 
@@ -384,13 +379,13 @@ def main():
     restart_xray(users)
     time.sleep(1)
 
-    # تشغيل خيوط مراقبة السجل وفك الحظر
+    # تشغيل مهام المراقبة
     threading.Thread(target=access_log_reader, daemon=True).start()
     threading.Thread(target=unblock_worker, daemon=True).start()
 
     last_stats = get_user_traffic() or {}
     last_active = {
-        e for e, d in users.items() if d.get("quota_bytes", 0) > 0
+        str(k) for k, d in users.items() if d.get("quota_bytes", 0) > 0
     }
     last_sync_time = time.time()
     last_quota_check = time.time()
@@ -402,35 +397,41 @@ def main():
         if now - last_quota_check >= 3:
             current_stats = get_user_traffic()
             if current_stats is not None:
-                for email in list(users.keys()):
-                    cur = current_stats.get(email, 0)
-                    prev = last_stats.get(email, 0)
+                for user_id, udata in list(users.items()):
+                    uid_str = str(user_id)
+                    cur = current_stats.get(uid_str, 0)
+                    prev = last_stats.get(uid_str, 0)
                     used = cur - prev
                     if used < 0:
                         used = cur
 
                     if used > 0:
-                        new_quota = atomic_deduct_user_bytes(email, used)
+                        new_quota = atomic_deduct_user_bytes(user_id, used)
                         if new_quota >= 0:
-                            if email in users:
-                                users[email]["quota_bytes"] = new_quota
+                            udata["quota_bytes"] = new_quota
                             if new_quota <= 0:
-                                xray_api_remove_user(email)
+                                xray_api_remove_user(uid_str)
                                 with ips_lock:
-                                    ips_seen.pop(email, None)
-                                log(f"🚫 Quota finished: {email}")
+                                    ips_seen.pop(uid_str, None)
+                                log(f"🚫 Quota finished: {uid_str}")
+                                send_telegram(
+                                    f"🚫 نفدت كوتا الحساب: <code>{uid_str}</code>"
+                                )
                 last_stats = current_stats
             last_quota_check = now
 
-        # مزامنة المستخدمين الجدد كل 20 ثانية مع احترام قائمة المحظورين
+        # مزامنة المستخدمين الجدد من Redis كل 20 ثانية مع حماية المحظورين
         if now - last_sync_time >= 20:
             try:
                 users = get_all_users()
                 current_active = {
-                    e for e, d in users.items() if d.get("quota_bytes", 0) > 0
+                    str(k)
+                    for k, d in users.items()
+                    if d.get("quota_bytes", 0) > 0
                 }
+
                 with blocked_lock:
-                    currently_blocked = set(blocked_users.keys())
+                    currently_blocked = set(str(k) for k in blocked_users)
 
                 if current_active - last_active:
                     log("New users detected, updating Xray...")
