@@ -29,15 +29,15 @@ XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
-BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # ثواني الحظر
-IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "90"))  # نافذة التتبع
+BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))
+IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "90"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", "8812248294:AAHbQnTWwkkneggwN8G8yTg_1HyYoy95S5I"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
-# نمط يطابق بدقة سجل Xray الرسمي ويستخرج الآيبي ومعرف المستخدم (Telegram ID / Key)
+# نمط يطابق سجل الدخول في Xray مع استخراج IP ومعرف الحساب بدقة
 ACCESS_LINE_RE = re.compile(
     r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
 )
@@ -62,7 +62,7 @@ def send_telegram(text):
 
 
 # ==============================================================================
-# اتصال Redis وخصم الكوتا (Lua Script المجرّب)
+# اتصال Redis
 # ==============================================================================
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
@@ -115,7 +115,7 @@ def get_all_users():
 
 
 # ==============================================================================
-# إدارة Xray (نفس البنية المجرّبة لديك مع تفعيل PROXY protocol)
+# إدارة وتشغيل Xray
 # ==============================================================================
 def restart_xray(users, blocked_set=None):
     if blocked_set is None:
@@ -191,9 +191,9 @@ def restart_xray(users, blocked_set=None):
 
 def xray_api_remove_user(user_id):
     cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
-    res = subprocess.run(
-        cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if res.returncode != 0:
+        log(f"API rmu output: {res.stderr.strip() or res.stdout.strip()}")
     return res.returncode == 0
 
 
@@ -210,22 +210,23 @@ def xray_api_add_user(user_id, uuid):
             }
         ]
     }
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
         tmp = f.name
     try:
         cmd = [XRAY_BIN, "api", "adu", f"--server={XRAY_API_SERVER}", tmp]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         return res.returncode == 0
+    except Exception as e:
+        log(f"API adu exception: {e}")
+        return False
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
 
 
 # ==============================================================================
-# كشف العناوين المتعددة وفصل الحساب
+# كشف العناوين المتعددة (Anti Account-Sharing)
 # ==============================================================================
 ips_seen = defaultdict(dict)  # user_id -> {ip: timestamp}
 ips_lock = threading.Lock()
@@ -240,7 +241,7 @@ def kick_and_block(user_id, ips):
             return
         blocked_users[user_id] = now + BLOCK_DURATION
 
-    # طرد فوري عبر API
+    # قطع الاتصال فوراً
     xray_api_remove_user(user_id)
 
     with ips_lock:
@@ -322,7 +323,14 @@ def unblock_worker():
                 udata = current_users.get(user_id)
                 if udata and udata.get("quota_bytes", 0) > 0:
                     uuid = udata.get("uuid")
-                    if uuid and xray_api_add_user(user_id, uuid):
+                    if uuid:
+                        # محاولة الإضافة عبر API أولاً
+                        success = xray_api_add_user(user_id, uuid)
+                        if not success:
+                            # إعادة تشغيل سريعة كحل احتياطي لضمان عودة المستخدم
+                            with blocked_lock:
+                                current_b = set(str(k) for k in blocked_users)
+                            restart_xray(current_users, blocked_set=current_b)
                         log(f"✅ Unblocked: {user_id}")
                         send_telegram(
                             f"✅ انتهى الحظر المؤقت وتمت إعادة تفعيل الحساب:\n<code>{user_id}</code>"
@@ -366,7 +374,6 @@ def main():
     os.makedirs("/var/log/xray", exist_ok=True)
     open(XRAY_ACCESS_LOG, "a").close()
 
-    # تشغيل الوكيل
     try:
         import proxy
 
@@ -379,7 +386,6 @@ def main():
     restart_xray(users)
     time.sleep(1)
 
-    # تشغيل مهام المراقبة
     threading.Thread(target=access_log_reader, daemon=True).start()
     threading.Thread(target=unblock_worker, daemon=True).start()
 
@@ -420,7 +426,7 @@ def main():
                 last_stats = current_stats
             last_quota_check = now
 
-        # مزامنة المستخدمين الجدد من Redis كل 20 ثانية مع حماية المحظورين
+        # مزامنة المستخدمين الجدد من Redis كل 20 ثانية
         if now - last_sync_time >= 20:
             try:
                 users = get_all_users()
