@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TCP Proxy with PROXY protocol v1 injection for Xray-core."""
+"""
+TCP Proxy with PROXY protocol v1 injection for Xray-core.
+Supports IPv4 & IPv6 with WebSocket path sanitation.
+"""
 
 import ipaddress
 import os
@@ -23,7 +26,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
 
     def handle(self):
         client = self.request
-        client.settimeout(30)
+        client.settimeout(15)  # مهلة مخصصة لقراءة المصافحة فقط
+        backend = None
         try:
             data = self._read_headers(client)
             if not data:
@@ -33,10 +37,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             method, path, _ = self._parse_request_line(headers_str)
             headers = self._parse_headers(headers_str)
 
-            # تنظيف المسار من أي معاملات مثل ?ed=2048
             clean_path = path.split("?")[0].rstrip("/")
-
-            # التحقق من المسار والطلب
             if clean_path != WS_PATH or method.upper() != "GET":
                 response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
                 client.sendall(response)
@@ -45,21 +46,31 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             client_ip = self._get_client_ip(headers, client)
             client_port = client.getpeername()[1]
 
-            # كشف نوع العنوان (IPv4 أو IPv6) لإنشاء ترويسة PROXY protocol قياسية
+            # تحديد البروتوكول وعنوان الوجهة المطابق للمواصفة القياسية
             try:
                 ip_obj = ipaddress.ip_address(client_ip)
-                proto = "TCP6" if ip_obj.version == 6 else "TCP4"
+                if ip_obj.version == 6:
+                    proto = "TCP6"
+                    dest_ip = "::1"
+                else:
+                    proto = "TCP4"
+                    dest_ip = BACKEND_HOST
             except ValueError:
                 proto = "TCP4"
+                dest_ip = BACKEND_HOST
 
             backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            backend.settimeout(30)
+            backend.settimeout(15)
             backend.connect((BACKEND_HOST, BACKEND_PORT))
 
-            # حقن الترويسة القياسية لـ PROXY protocol v1
-            proxy_line = f"PROXY {proto} {client_ip} {BACKEND_HOST} {client_port} {BACKEND_PORT}\r\n".encode()
+            # حقن الترويسة القياسية لـ PROXY Protocol
+            proxy_line = f"PROXY {proto} {client_ip} {dest_ip} {client_port} {BACKEND_PORT}\r\n".encode()
             backend.sendall(proxy_line)
             backend.sendall(data)
+
+            # إلغاء المهلة قبل النقل لمنع فصل الاتصال أثناء الخمول
+            client.settimeout(None)
+            backend.settimeout(None)
 
             stop_event = threading.Event()
             t1 = threading.Thread(
@@ -76,9 +87,17 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             t2.join()
 
         except Exception as e:
-            log(f"Handler error: {e}")
+            log(f"Connection error: {e}")
         finally:
-            client.close()
+            if backend:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _read_headers(self, sock):
         data = b""
@@ -96,16 +115,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         if not lines:
             return "", "", ""
         parts = lines[0].split(" ")
-        if len(parts) >= 3:
-            return parts[0], parts[1], parts[2]
-        return "", "", ""
+        return (parts[0], parts[1], parts[2]) if len(parts) >= 3 else ("", "", "")
 
     def _parse_headers(self, headers_str):
         headers = {}
         for line in headers_str.split("\r\n")[1:]:
             if ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip().lower()] = value.strip()
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
         return headers
 
     def _get_client_ip(self, headers, client):
