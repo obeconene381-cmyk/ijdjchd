@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import ipaddress
 import json
 import os
 import re
@@ -14,7 +13,7 @@ from urllib import parse, request
 import redis
 
 # ==============================================================================
-# الإعدادات العامة
+# الإعدادات
 # ==============================================================================
 REDIS_URL = os.environ.get(
     "REDIS_URL", "redis://:CoraNetRedis2026SecurePass@54.86.129.233:6379/0"
@@ -30,7 +29,7 @@ XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
 BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # مدة الحظر بالثواني
-IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "60"))  # نافذة احتساب الشبكات
+IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "90"))  # نافذة احتساب الآيبي
 SYNC_INTERVAL = 40  # دورة المزامنة وإعادة التشغيل الموحدة (كل 40 ثانية)
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
@@ -38,7 +37,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get(
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
-# نمط استخراج الآيبي والـ ID بدقة
 ACCESS_LINE_RE = re.compile(
     r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
 )
@@ -62,21 +60,8 @@ def send_telegram(text):
         log(f"Telegram error: {e}")
 
 
-def get_ip_subnet(ip_str):
-    """تجميع العناوين بنطاق /24 للـ IPv4 و /64 للـ IPv6 لمنع حظر 4G الذاتي"""
-    try:
-        clean_ip = ip_str.strip("[]")
-        ip_obj = ipaddress.ip_address(clean_ip)
-        if ip_obj.version == 4:
-            return str(ipaddress.ip_network(f"{clean_ip}/24", strict=False))
-        else:
-            return str(ipaddress.ip_network(f"{clean_ip}/64", strict=False))
-    except Exception:
-        return ip_str
-
-
 # ==============================================================================
-# اتصال Redis والخصم الأتمي للكوتا
+# اتصال Redis وخصم الكوتا أتمياً
 # ==============================================================================
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
@@ -204,42 +189,39 @@ def restart_xray(users, blocked_set=None):
 
 
 def xray_api_remove_user(user_id):
-    """طرد فوري للمستخدم لحظة رصد المخالفة دون إعادة تشغيل"""
     cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
     res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return res.returncode == 0
 
 
 # ==============================================================================
-# كشف تعدد الأجهزة الذكي (تمييز وضع الطيران عن المشاركة الفعلية)
+# كشف تعدد الأجهزة المباشر (الطرد الفوري عند رصد عنوانين)
 # ==============================================================================
-device_tracker = defaultdict(lambda: {"last_subnet": None, "subnets": {}})
-tracker_lock = threading.Lock()
-blocked_users = {}  # user_id -> unblock_timestamp
+ips_seen = defaultdict(dict)
+ips_lock = threading.Lock()
+blocked_users = {}
 blocked_lock = threading.Lock()
 
 
-def kick_and_block(user_id, distinct_ips):
+def kick_and_block(user_id, ips):
     now = time.time()
     with blocked_lock:
         if now < blocked_users.get(user_id, 0):
             return
         blocked_users[user_id] = now + BLOCK_DURATION
 
-    # طرد فوري للجلسة النشطة
     xray_api_remove_user(user_id)
 
-    with tracker_lock:
-        device_tracker.pop(user_id, None)
+    with ips_lock:
+        ips_seen.pop(user_id, None)
 
-    log(f"🚨 Sharing detected! Kicked: {user_id} | IPs: {distinct_ips}")
+    log(f"🚨 Sharing detected! Kicked: {user_id} | IPs: {ips}")
     send_telegram(
         f"🚨 <b>تم كشف مشاركة الحساب</b>\n"
         f"👤 المعرف (ID): <code>{user_id}</code>\n"
-        f"🌐 عدد الأجهزة: {len(distinct_ips)}\n"
-        f"📋 العناوين: <code>{', '.join(distinct_ips)}</code>\n"
-        f"⛔ تم قطع الاتصال فوراً وحظر الحساب مؤقتاً.\n"
-        f"⚠️ <i>تنبيه: أوقف الـ VPN في الجهاز الآخر قبل معاودة الاتصال.</i>"
+        f"🌐 عدد الأجهزة: {len(ips)}\n"
+        f"📋 العناوين: <code>{', '.join(ips)}</code>\n"
+        f"⛔ تم قطع الاتصال فوراً وحظر الحساب مؤقتاً."
     )
 
 
@@ -249,54 +231,17 @@ def handle_new_connection(user_id, ip):
         if now < blocked_users.get(user_id, 0):
             return
 
-    current_sub = get_ip_subnet(ip)
+    with ips_lock:
+        table = ips_seen[user_id]
+        for old_ip in list(table.keys()):
+            if now - table[old_ip] > IP_TTL_SECONDS:
+                del table[old_ip]
 
-    with tracker_lock:
-        state = device_tracker[user_id]
-        subnets = state["subnets"]
+        table[ip] = now
+        active_ips = list(table.keys())
 
-        # مسح النطاقات الخاملة لأكثر من 60 ثانية
-        for sub in list(subnets.keys()):
-            if now - subnets[sub]["time"] > IP_TTL_SECONDS:
-                del subnets[sub]
-
-        last_sub = state["last_subnet"]
-
-        # الحالة 1: أول اتصال للمستخدم
-        if last_sub is None:
-            state["last_subnet"] = current_sub
-            subnets[current_sub] = {"ip": ip, "time": now, "count": 1}
-            return
-
-        # الحالة 2: نفس الجهاز مستمر في التصفح من نفس النطاق
-        if current_sub == last_sub:
-            subnets[current_sub]["time"] = now
-            subnets[current_sub]["ip"] = ip
-            subnets[current_sub]["count"] = subnets[current_sub].get("count", 0) + 1
-            return
-
-        # الحالة 3: وصول طلب من نطاق يختلف عن آخر نطاق نشط
-        # فحص ظاهرة التبادل (Ping-Pong): إذا كان النطاق الحالي شوهد مسبقاً وما زال القديم نشطاً
-        # هذا يثبت وجود جهازين يرسلان طلبات بالتناوب في نفس اللحظة
-        if current_sub in subnets:
-            prev_time = subnets[last_sub]["time"]
-            if (now - prev_time) <= 35:
-                # تبادل متزامن مؤكد بنسبة 100%
-                active_ips = list({v["ip"] for v in subnets.values()} | {ip})
-                kick_and_block(user_id, active_ips)
-                return
-
-        # فحص التزامن اللحظي المباشر (طلب من جهازين خلال أقل من 10 ثوانٍ)
-        prev_sub_time = subnets.get(last_sub, {}).get("time", 0)
-        if (now - prev_sub_time) <= 10 and subnets.get(last_sub, {}).get("count", 0) >= 2:
-            # جهازان نشطان معاً في نفس اللحظة
-            active_ips = [subnets[last_sub]["ip"], ip]
-            kick_and_block(user_id, active_ips)
-            return
-
-        # إذا مر وقت كافٍ وانقطع النطاق القديم: انتقال طبيعي للشبكة (مثل وضع الطيران)
-        subnets[current_sub] = {"ip": ip, "time": now, "count": 1}
-        state["last_subnet"] = current_sub
+    if len(active_ips) > 1:
+        kick_and_block(user_id, active_ips)
 
 
 def access_log_reader():
@@ -333,9 +278,6 @@ def access_log_reader():
         log(f"access_log_reader error: {exc}")
 
 
-# ==============================================================================
-# جلب الترافيك
-# ==============================================================================
 def get_user_traffic():
     cmd = [
         XRAY_BIN,
@@ -417,8 +359,8 @@ def main():
                             udata["quota_bytes"] = new_quota
                             if new_quota <= 0:
                                 xray_api_remove_user(uid_str)
-                                with tracker_lock:
-                                    device_tracker.pop(uid_str, None)
+                                with ips_lock:
+                                    ips_seen.pop(uid_str, None)
                                 log(f"🚫 Quota finished: {uid_str}")
                                 send_telegram(
                                     f"🚫 نفدت كوتا الحساب: <code>{uid_str}</code>"
@@ -426,12 +368,11 @@ def main():
                 last_stats = current_stats
             last_quota_check = now
 
-        # دورة المزامنة وفك الحظر الموحدة (كل 40 ثانية بالضبط)
+        # دورة المزامنة وفك الحظر الموحدة (كل 40 ثانية)
         if now - last_sync_time >= SYNC_INTERVAL:
             try:
                 users = get_all_users()
 
-                # استخراج الحسابات التي انتهت مدة حظرها
                 unblocked_users = []
                 with blocked_lock:
                     for uid, unblock_time in list(blocked_users.items()):
@@ -449,7 +390,6 @@ def main():
                     and str(u_id) not in currently_blocked
                 }
 
-                # إعادة تشغيل Xray فقط عند وجود فك حظر أو تغيير في المستخدمين
                 if target_clients != last_loaded_clients or unblocked_users:
                     log("Sync cycle (40s): Changes detected, reloading Xray once...")
                     restart_xray(users, blocked_set=currently_blocked)
@@ -457,16 +397,15 @@ def main():
                     last_loaded_clients = target_clients
                     last_stats = get_user_traffic() or last_stats
 
-                    # تنظيف سجل التتبع وإرسال الإشعار بعد أن أصبح Xray جاهزاً فعلياً
-                    with tracker_lock:
+                    with ips_lock:
                         for uid in unblocked_users:
-                            device_tracker.pop(uid, None)
+                            ips_seen.pop(uid, None)
 
                     for uid in unblocked_users:
                         log(f"✅ Unblocked and live: {uid}")
                         send_telegram(
                             f"✅ <b>انتهى الحظر المؤقت للحساب:</b>\n<code>{uid}</code>\n"
-                            f"🚀 تم تجهيز السيرفر بنجاح، يمكنك الاتصال الآن بأمان."
+                            f"🔄 تم تجهيز السيرفر، يمكنك الاتصال الآن."
                         )
                 else:
                     log("Sync cycle (40s): Stable. No client changes.")
