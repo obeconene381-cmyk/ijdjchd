@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import html
 import json
 import os
 import re
@@ -29,10 +30,11 @@ XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
 BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # مدة الحظر بالثواني
-SYNC_INTERVAL = 40  # دورة المزامنة وفك الحظر
+SYNC_INTERVAL = 40  # دورة فك الحظر والمزامنة مع ريديس
 
+# التوكن الجديد المحدث
 TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8812248294:AAHbQnTWwkkneggwN8G8yTg_1HyYoy95S5I"
+    "TELEGRAM_BOT_TOKEN", "8812248294:AAHD5aPVPSGbgtgqFUE7PDMW67kcllAZKmw"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
@@ -60,7 +62,7 @@ def send_telegram(text):
 
 
 # ==============================================================================
-# اتصال Redis وجلب المستخدمين (بدون فحص الكوتا)
+# اتصال Redis وجلب المستخدمين
 # ==============================================================================
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
@@ -92,10 +94,10 @@ def get_all_users():
 
 
 # ==============================================================================
-# إدارة وتشغيل Xray والتأكد من فتح المنفذ 5000
+# إدارة وتشغيل Xray وفحص الجاهزية
 # ==============================================================================
 def wait_for_port(port=5000, timeout=10):
-    """فحص مباشر للبورت: لا يسمح بإكمال الإقلاع حتى يفتح Xray المنفذ 5000"""
+    """التحقق المباشر من أن المنفذ مفتوح وجاهز لاستقبال الاتصالات"""
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -113,13 +115,18 @@ def restart_xray(users, blocked_set=None):
     clients = []
     seen_uuids = set()
 
-    # تحميل جميع أصحاب الـ UUID بدون شرط الكوتا نهائياً
     for user_id, data in users.items():
         uuid = str(data.get("uuid", "")).strip().lower()
-        if uuid and len(uuid) == 36 and uuid not in seen_uuids and str(user_id) not in blocked_set:
+        if (
+            uuid
+            and len(uuid) == 36
+            and uuid not in seen_uuids
+            and str(user_id) not in blocked_set
+        ):
             seen_uuids.add(uuid)
             clients.append({"id": uuid, "email": str(user_id)})
 
+    # مستخدم افتراضي لمنع انهيار Xray في حال كانت القائمة فارغة
     if not clients:
         clients = [{
             "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
@@ -174,29 +181,38 @@ def restart_xray(users, blocked_set=None):
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
-    # قتل نظيف وتحرير المنفذ
-    subprocess.run(["pkill", "-9", "-f", "xray"], stderr=subprocess.DEVNULL)
+    # قتل نظيف ودقيق باسم العملية التنفيذية فقط
+    subprocess.run(["pkill", "-9", "-x", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.5)
 
     subprocess.Popen([XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH])
-    
-    # انتظار Xray حتى يصبح جاهزاً على البورت 5000
+
+    # انتظار فتح المنفذ مع تشخيص فوري للأخطاء في حال الفشل
     if wait_for_port(5000, timeout=8):
-        log(f"✅ Xray is LIVE and listening on port 5000 with {len(clients)} clients.")
+        log(f"✅ Xray is LIVE on port 5000 with {len(clients)} unique clients.")
     else:
         log("❌ Xray failed to bind port 5000 within timeout!")
+        if os.path.exists(XRAY_ERROR_LOG):
+            with open(XRAY_ERROR_LOG, "r") as ef:
+                err_content = ef.read().strip()
+                if err_content:
+                    log(f"📋 [XRAY ERROR DETAILS]:\n{err_content}")
 
 
 def xray_api_remove_user(user_id):
     """طرد فوري للمستخدم لحظة المخالفة دون إعادة تشغيل"""
     cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
-    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # ==============================================================================
 # كشف تعدد الأجهزة الذكي مع فحص الـ 5 ثوانٍ لوضع الطيران
 # ==============================================================================
-# user_tracker: user_id -> {"current_ip": ip, "ips": {ip: last_seen_time}, "verifying": bool}
 user_tracker = {}
 tracker_lock = threading.Lock()
 
@@ -211,23 +227,25 @@ def kick_and_block(user_id, ips):
             return
         blocked_users[user_id] = now + BLOCK_DURATION
 
-    # طرد فوري
     xray_api_remove_user(user_id)
 
     with tracker_lock:
         user_tracker.pop(user_id, None)
 
-    log(f"🚨 Sharing detected! Kicked: {user_id} | IPs: {ips}")
+    safe_uid = html.escape(str(user_id))
+    safe_ips = html.escape(", ".join(ips))
+
+    log(f"🚨 Multiple devices detected! Kicked: {user_id} | IPs: {ips}")
     send_telegram(
         f"🚨 <b>تم كشف مشاركة الحساب</b>\n"
-        f"👤 المعرف: <code>{user_id}</code>\n"
-        f"🌐 العناوين: <code>{', '.join(ips)}</code>\n"
+        f"👤 المعرف: <code>{safe_uid}</code>\n"
+        f"🌐 العناوين: <code>{safe_ips}</code>\n"
         f"⛔ تم الحظر المؤقت لمدة {BLOCK_DURATION} ثانية."
     )
 
 
 def verify_airplane_mode(user_id, old_ip, new_ip, switch_time):
-    """انتظار 5 ثوانٍ: إذا توقف الآيبي القديم فهو وضع طيران، وإذا استمر يرسل فهما جهازان"""
+    """انتظار 5 ثوانٍ: امتصاص الحزم المتأخرة والتحقق من بقاء الجهازين معاً"""
     time.sleep(5)
 
     with tracker_lock:
@@ -239,12 +257,10 @@ def verify_airplane_mode(user_id, old_ip, new_ip, switch_time):
 
         old_ip_last_seen = state["ips"].get(old_ip, 0)
 
-        # إذا واصل الآيبي القديم إرسال بايتات بعد لحظة ظهور الآيبي الجديد
-        if old_ip_last_seen >= switch_time:
-            # جهازان نشطان معاً في نفس الوقت -> حظر فوري
+        # إذا استمر الآيبي القديم في إرسال بايتات بعد ظهور الآيبي الجديد بأكثر من 1.2 ثانية
+        if old_ip_last_seen > (switch_time + 1.2):
             kick_and_block(user_id, [old_ip, new_ip])
         else:
-            # الآيبي القديم مات تماماً -> وضع طيران مؤكد
             log(f"✈️ Airplane mode confirmed for {user_id}. Switched to {new_ip}")
             state["current_ip"] = new_ip
             state["ips"].pop(old_ip, None)
@@ -268,11 +284,11 @@ def handle_new_connection(user_id, ip):
         state = user_tracker[user_id]
         state["ips"][ip] = now
 
-        # إذا كان الاتصال من نفس الآيبي، تصفح طبيعي
+        # تصفح طبيعي من نفس العنوان
         if ip == state["current_ip"]:
             return
 
-        # إذا ظهر آيبي جديد، لا نحظر مباشرة بل نبدأ فحص الـ 5 ثوانٍ
+        # ظهور آيبي جديد -> بدء فترة فحص وضع الطيران
         if not state["verifying"]:
             state["verifying"] = True
             old_ip = state["current_ip"]
@@ -295,8 +311,12 @@ def access_log_reader():
                 where = f.tell()
                 line = f.readline()
                 if not line:
-                    time.sleep(0.1)
-                    f.seek(where)
+                    # حماية من تدوير الملف أو مسحه
+                    if os.path.exists(XRAY_ACCESS_LOG) and os.path.getsize(XRAY_ACCESS_LOG) < where:
+                        f.seek(0)
+                    else:
+                        time.sleep(0.1)
+                        f.seek(where)
                     continue
 
                 if "accepted" not in line or "email:" not in line:
@@ -328,15 +348,15 @@ def main():
             pass
     open(XRAY_ACCESS_LOG, "a").close()
 
-    # 1. إقلاع Xray والتأكد من فتح المنفذ 5000 أولاً
+    # 1. تشغيل Xray والتأكد التام من فتح المنفذ 5000 أولاً
     users = get_all_users()
     restart_xray(users)
 
-    # 2. تشغيل proxy.py فقط بعد أن أصبح Xray جاهزاً (يمنع Connection refused تماماً)
+    # 2. تشغيل proxy.py بعد أن أصبحت الخلفية جاهزة (يمنع Connection refused تماماً)
     try:
         import proxy
         threading.Thread(target=proxy.main, daemon=True).start()
-        log("✅ Proxy started on port 8080 (Traffic routing active).")
+        log("✅ Proxy started on port 8080.")
     except Exception as e:
         log(f"❌ Proxy start error: {e}")
 
@@ -349,9 +369,22 @@ def main():
     }
 
     last_sync_time = time.time()
+    last_cleanup_time = time.time()
 
     while True:
         now = time.time()
+
+        # تنظيف دوري للذاكرة كل دقيقتين لمنع تسريب العناوين القديمة
+        if now - last_cleanup_time >= 120:
+            with tracker_lock:
+                for uid in list(user_tracker.keys()):
+                    ips_dict = user_tracker[uid]["ips"]
+                    for ip_addr, t_stamp in list(ips_dict.items()):
+                        if now - t_stamp > 180:
+                            del ips_dict[ip_addr]
+                    if not ips_dict:
+                        del user_tracker[uid]
+            last_cleanup_time = now
 
         # دورة المزامنة وفك الحظر كل 40 ثانية
         if now - last_sync_time >= SYNC_INTERVAL:
@@ -375,7 +408,7 @@ def main():
                     if data.get("uuid") and str(u_id) not in currently_blocked
                 }
 
-                # لا نعيد التشغيل إلا إذا كان هناك تغيير فعلي (فك حظر أو مشترك جديد)
+                # إعادة تشغيل Xray فقط عند وجود تحديث حقيقي (مستخدم جديد أو فك حظر)
                 if target_clients != last_loaded_clients or unblocked_users:
                     log("Sync cycle (40s): Reloading Xray for state updates...")
                     restart_xray(users, blocked_set=currently_blocked)
@@ -386,10 +419,11 @@ def main():
                             user_tracker.pop(uid, None)
 
                     for uid in unblocked_users:
+                        safe_u = html.escape(str(uid))
                         log(f"✅ Unblocked: {uid}")
                         send_telegram(
-                            f"✅ <b>انتهى الحظر المؤقت:</b>\n<code>{uid}</code>\n"
-                            f"🚀 تم تجهيز السيرفر، يمكنك معاودة الاتصال الآن."
+                            f"✅ <b>انتهى الحظر المؤقت:</b>\n<code>{safe_u}</code>\n"
+                            f"🚀 يمكنك معاودة الاتصال الآن بأمان."
                         )
 
                 last_sync_time = now
