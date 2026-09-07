@@ -30,13 +30,11 @@ XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
 BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # مدة الحظر بالثواني
-SYNC_INTERVAL = 40  # دورة فك الحظر والمزامنة مع ريديس
+SYNC_INTERVAL = 40  # دورة المزامنة وفك الحظر
 
-# التوكن الجديد المحدث
-TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8812248294:AAHD5aPVPSGbgtgqFUE7PDMW67kcllAZKmw"
-)
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
+# التوكن الجديد مثبت مباشرة
+TELEGRAM_BOT_TOKEN = "8812248294:AAHD5aPVPSGbgtgqFUE7PDMW67kcllAZKmw"
+TELEGRAM_CHAT_ID = "5813081202"
 
 ACCESS_LINE_RE = re.compile(
     r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
@@ -94,10 +92,9 @@ def get_all_users():
 
 
 # ==============================================================================
-# إدارة وتشغيل Xray وفحص الجاهزية
+# تشغيل Xray والتأكد من فتح المنفذ 5000
 # ==============================================================================
 def wait_for_port(port=5000, timeout=10):
-    """التحقق المباشر من أن المنفذ مفتوح وجاهز لاستقبال الاتصالات"""
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -126,7 +123,6 @@ def restart_xray(users, blocked_set=None):
             seen_uuids.add(uuid)
             clients.append({"id": uuid, "email": str(user_id)})
 
-    # مستخدم افتراضي لمنع انهيار Xray في حال كانت القائمة فارغة
     if not clients:
         clients = [{
             "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
@@ -181,40 +177,30 @@ def restart_xray(users, blocked_set=None):
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
-    # قتل نظيف ودقيق باسم العملية التنفيذية فقط
     subprocess.run(["pkill", "-9", "-x", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.5)
 
     subprocess.Popen([XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH])
 
-    # انتظار فتح المنفذ مع تشخيص فوري للأخطاء في حال الفشل
     if wait_for_port(5000, timeout=8):
-        log(f"✅ Xray is LIVE on port 5000 with {len(clients)} unique clients.")
+        log(f"✅ Xray is LIVE on port 5000 with {len(clients)} clients.")
     else:
-        log("❌ Xray failed to bind port 5000 within timeout!")
-        if os.path.exists(XRAY_ERROR_LOG):
-            with open(XRAY_ERROR_LOG, "r") as ef:
-                err_content = ef.read().strip()
-                if err_content:
-                    log(f"📋 [XRAY ERROR DETAILS]:\n{err_content}")
+        log("❌ Xray failed to bind port 5000!")
 
 
 def xray_api_remove_user(user_id):
-    """طرد فوري للمستخدم لحظة المخالفة دون إعادة تشغيل"""
+    """طرد فوري للمستخدم لحظة رصد المخالفة دون إعادة تشغيل"""
     cmd = f'{XRAY_BIN} api rmu --server={XRAY_API_SERVER} -tag="{XRAY_INBOUND_TAG}" "{user_id}"'
     subprocess.run(
-        cmd,
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
 
 # ==============================================================================
-# كشف تعدد الأجهزة الذكي مع فحص الـ 5 ثوانٍ لوضع الطيران
+# كشف تعدد الأجهزة اللحظي مع حماية وضع الطيران
 # ==============================================================================
-user_tracker = {}
-tracker_lock = threading.Lock()
+user_state = {}  # user_id -> {"primary_ip": str, "last_seen": float, "pending_ip": str, "pending_time": float}
+state_lock = threading.Lock()
 
 blocked_users = {}  # user_id -> unblock_timestamp
 blocked_lock = threading.Lock()
@@ -227,76 +213,91 @@ def kick_and_block(user_id, ips):
             return
         blocked_users[user_id] = now + BLOCK_DURATION
 
+    # طرد فوري
     xray_api_remove_user(user_id)
 
-    with tracker_lock:
-        user_tracker.pop(user_id, None)
+    with state_lock:
+        user_state.pop(user_id, None)
 
     safe_uid = html.escape(str(user_id))
     safe_ips = html.escape(", ".join(ips))
 
-    log(f"🚨 Multiple devices detected! Kicked: {user_id} | IPs: {ips}")
+    log(f"🚨 Multi-device detected! Kicked: {user_id} | IPs: {ips}")
     send_telegram(
         f"🚨 <b>تم كشف مشاركة الحساب</b>\n"
         f"👤 المعرف: <code>{safe_uid}</code>\n"
         f"🌐 العناوين: <code>{safe_ips}</code>\n"
-        f"⛔ تم الحظر المؤقت لمدة {BLOCK_DURATION} ثانية."
+        f"⛔ تم الطرد والحظر المؤقت لمدة {BLOCK_DURATION} ثانية."
     )
-
-
-def verify_airplane_mode(user_id, old_ip, new_ip, switch_time):
-    """انتظار 5 ثوانٍ: امتصاص الحزم المتأخرة والتحقق من بقاء الجهازين معاً"""
-    time.sleep(5)
-
-    with tracker_lock:
-        if user_id not in user_tracker:
-            return
-
-        state = user_tracker[user_id]
-        state["verifying"] = False
-
-        old_ip_last_seen = state["ips"].get(old_ip, 0)
-
-        # إذا استمر الآيبي القديم في إرسال بايتات بعد ظهور الآيبي الجديد بأكثر من 1.2 ثانية
-        if old_ip_last_seen > (switch_time + 1.2):
-            kick_and_block(user_id, [old_ip, new_ip])
-        else:
-            log(f"✈️ Airplane mode confirmed for {user_id}. Switched to {new_ip}")
-            state["current_ip"] = new_ip
-            state["ips"].pop(old_ip, None)
 
 
 def handle_new_connection(user_id, ip):
     now = time.time()
+
     with blocked_lock:
         if now < blocked_users.get(user_id, 0):
             return
 
-    with tracker_lock:
-        if user_id not in user_tracker:
-            user_tracker[user_id] = {
-                "current_ip": ip,
-                "ips": {ip: now},
-                "verifying": False,
+    with state_lock:
+        # أول اتصال للمستخدم
+        if user_id not in user_state:
+            user_state[user_id] = {
+                "primary_ip": ip,
+                "last_seen": now,
+                "pending_ip": None,
+                "pending_time": 0.0,
             }
             return
 
-        state = user_tracker[user_id]
-        state["ips"][ip] = now
+        st = user_state[user_id]
+        primary = st["primary_ip"]
+        pending = st["pending_ip"]
 
-        # تصفح طبيعي من نفس العنوان
-        if ip == state["current_ip"]:
+        # -------------------------------------------------------------
+        # 1. الطلب وارد من الآيبي الأساسي (Primary IP)
+        # -------------------------------------------------------------
+        if ip == primary:
+            # إذا دخل آيبي جديد سابقاً ووضع قيد المراقبة، والآن الآيبي الأساسي لا يزال يرسل طلبات بعد مرور ثانية واحدة:
+            # هذا يؤكد وجود جهازين يرسلان البيانات معاً في نفس اللحظة
+            if pending and (now - st["pending_time"] <= 5.0) and (now - st["pending_time"] >= 0.8):
+                kick_and_block(user_id, [primary, pending])
+                return
+
+            st["last_seen"] = now
+            # إذا مرت أكثر من 5 ثوانٍ على الآيبي المرشح ولم يرسل شيئاً، يتم إلغاؤه
+            if pending and (now - st["pending_time"] > 5.0):
+                st["pending_ip"] = None
             return
 
-        # ظهور آيبي جديد -> بدء فترة فحص وضع الطيران
-        if not state["verifying"]:
-            state["verifying"] = True
-            old_ip = state["current_ip"]
-            threading.Thread(
-                target=verify_airplane_mode,
-                args=(user_id, old_ip, ip, now),
-                daemon=True,
-            ).start()
+        # -------------------------------------------------------------
+        # 2. الطلب وارد من آيبي مختلف عن الآيبي الأساسي
+        # -------------------------------------------------------------
+        time_since_primary = now - st["last_seen"]
+
+        # الحالة أ: الآيبي القديم توقف تماماً منذ أكثر من 5 ثوانٍ -> وضع طيران مؤكد
+        if time_since_primary > 5.0:
+            log(f"✈️ Airplane mode: {user_id} switched from {primary} to {ip}")
+            st["primary_ip"] = ip
+            st["last_seen"] = now
+            st["pending_ip"] = None
+            return
+
+        # الحالة ب: الآيبي القديم كان نشطاً قبل أقل من 5 ثوانٍ
+        if pending is None:
+            # وضع الآيبي الجديد قيد المراقبة لمدة 5 ثوانٍ
+            st["pending_ip"] = ip
+            st["pending_time"] = now
+        elif ip == pending:
+            # الآيبي الجديد يواصل التصفح
+            # إذا استمر 5 ثوانٍ كاملة دون أن يرسل الآيبي القديم أي بايت -> ترقية الآيبي الجديد
+            if now - st["pending_time"] > 5.0:
+                log(f"✈️ Fast switch confirmed: {user_id} now on {ip}")
+                st["primary_ip"] = ip
+                st["last_seen"] = now
+                st["pending_ip"] = None
+        else:
+            # ظهور آيبي ثالث مختلف في نفس النافذة -> طرد فوري
+            kick_and_block(user_id, [primary, pending, ip])
 
 
 def access_log_reader():
@@ -311,11 +312,10 @@ def access_log_reader():
                 where = f.tell()
                 line = f.readline()
                 if not line:
-                    # حماية من تدوير الملف أو مسحه
                     if os.path.exists(XRAY_ACCESS_LOG) and os.path.getsize(XRAY_ACCESS_LOG) < where:
                         f.seek(0)
                     else:
-                        time.sleep(0.1)
+                        time.sleep(0.05)
                         f.seek(where)
                     continue
 
@@ -348,11 +348,11 @@ def main():
             pass
     open(XRAY_ACCESS_LOG, "a").close()
 
-    # 1. تشغيل Xray والتأكد التام من فتح المنفذ 5000 أولاً
+    # 1. تشغيل Xray والتأكد من جاهزية المنفذ 5000 أولاً
     users = get_all_users()
     restart_xray(users)
 
-    # 2. تشغيل proxy.py بعد أن أصبحت الخلفية جاهزة (يمنع Connection refused تماماً)
+    # 2. تشغيل proxy.py على 8080 بعد التأكد من أن Xray جاهز
     try:
         import proxy
         threading.Thread(target=proxy.main, daemon=True).start()
@@ -374,19 +374,15 @@ def main():
     while True:
         now = time.time()
 
-        # تنظيف دوري للذاكرة كل دقيقتين لمنع تسريب العناوين القديمة
-        if now - last_cleanup_time >= 120:
-            with tracker_lock:
-                for uid in list(user_tracker.keys()):
-                    ips_dict = user_tracker[uid]["ips"]
-                    for ip_addr, t_stamp in list(ips_dict.items()):
-                        if now - t_stamp > 180:
-                            del ips_dict[ip_addr]
-                    if not ips_dict:
-                        del user_tracker[uid]
+        # تنظيف الحسابات الخاملة كل 3 دقائق
+        if now - last_cleanup_time >= 180:
+            with state_lock:
+                for uid in list(user_state.keys()):
+                    if now - user_state[uid]["last_seen"] > 300:
+                        del user_state[uid]
             last_cleanup_time = now
 
-        # دورة المزامنة وفك الحظر كل 40 ثانية
+        # دورة فك الحظر والمزامنة كل 40 ثانية
         if now - last_sync_time >= SYNC_INTERVAL:
             try:
                 fresh_users = get_all_users()
@@ -408,22 +404,21 @@ def main():
                     if data.get("uuid") and str(u_id) not in currently_blocked
                 }
 
-                # إعادة تشغيل Xray فقط عند وجود تحديث حقيقي (مستخدم جديد أو فك حظر)
                 if target_clients != last_loaded_clients or unblocked_users:
-                    log("Sync cycle (40s): Reloading Xray for state updates...")
+                    log("Sync cycle (40s): Updating clients in Xray...")
                     restart_xray(users, blocked_set=currently_blocked)
                     last_loaded_clients = target_clients
 
-                    with tracker_lock:
+                    with state_lock:
                         for uid in unblocked_users:
-                            user_tracker.pop(uid, None)
+                            user_state.pop(uid, None)
 
                     for uid in unblocked_users:
                         safe_u = html.escape(str(uid))
                         log(f"✅ Unblocked: {uid}")
                         send_telegram(
-                            f"✅ <b>انتهى الحظر المؤقت:</b>\n<code>{safe_u}</code>\n"
-                            f"🚀 يمكنك معاودة الاتصال الآن بأمان."
+                            f"✅ <b>انتهى الحظر المؤقت للحساب:</b>\n<code>{safe_u}</code>\n"
+                            f"🚀 يمكنك معاودة الاتصال الآن."
                         )
 
                 last_sync_time = now
