@@ -29,15 +29,16 @@ XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1")
 
 BLOCK_DURATION = int(os.environ.get("BLOCK_DURATION", "60"))  # مدة الحظر بالثواني
-IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "30"))  # نافذة نشاط الشبكة
+IP_TTL_SECONDS = int(os.environ.get("IP_TTL_SECONDS", "12"))  # نافذة نشاط الشبكة
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", "8468334139:AAHTCT7WkqvkXiipJaLOTWUD-zfNRjUTur4"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5813081202")
 
+# نمط استخراج التوقيت الفعلي والآيبي ومعرف المستخدم من سجلات Xray
 ACCESS_LINE_RE = re.compile(
-    r"(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
+    r"(?:(?P<log_time>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+)?(?:tcp:)?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted\s+.*?email:\s*(?P<user_id>\S+)"
 )
 
 
@@ -59,18 +60,37 @@ def send_telegram(text):
         log(f"Telegram error: {e}")
 
 
+def parse_log_time(time_str):
+    """تحويل توقيت سطر السجل إلى Unix Timestamp"""
+    if not time_str:
+        return time.time()
+    try:
+        return time.mktime(time.strptime(time_str, "%Y/%m/%d %H:%M:%S"))
+    except Exception:
+        return time.time()
+
+
 def get_network_prefix(ip_str):
     """
-    تجاهل آخر رقمين من الآيبي لمنع حظر تقلبات أبراج 4G
-    129.45.41.55 و 129.45.82.87 كلاهما يُعامل كشبكة واحدة: 129.45
+    اقتطاع موحد لجميع الشبكات:
+    - IPv4: أول رقمين فقط (A.B)
+    - IPv6: أول خانتين فقط (X:Y)
     """
     try:
         clean_ip = ip_str.strip("[]")
-        parts = clean_ip.split(".")
-        if len(parts) == 4:
-            return f"{parts[0]}.{parts[1]}"
+
+        # معالجة IPv4
+        if "." in clean_ip:
+            parts = clean_ip.split(".")
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+
+        # معالجة IPv6
         if ":" in clean_ip:
-            return ":".join(clean_ip.split(":")[:3])
+            parts = [p for p in clean_ip.split(":") if p]
+            if len(parts) >= 2:
+                return f"{parts[0]}:{parts[1]}"
+
         return clean_ip
     except Exception:
         return ip_str
@@ -107,9 +127,10 @@ def get_all_users():
 
 
 # ==============================================================================
-# إدارة Xray (سريعة ومباشرة بدون انتظار منافذ)
+# إدارة Xray عبر gRPC وسرعة الإقلاع
 # ==============================================================================
 def restart_xray(users, blocked_set=None):
+    """إعادة تشغيل Xray الأولية السريعة دون فحص منافذ معطل"""
     if blocked_set is None:
         blocked_set = set()
 
@@ -166,37 +187,60 @@ def restart_xray(users, blocked_set=None):
     subprocess.run(["pkill", "-9", "-f", "xray"], stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.Popen([XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH])
-    log(f"⚡ Xray cleanly reloaded with {len(clients)} active clients.")
+    log(f"⚡ Xray cleanly loaded with {len(clients)} clients.")
 
 
 def xray_api_remove_user(user_id):
-    """طرد فوري للجلسة عبر الـ API بدون إعادة تشغيل"""
+    """طرد المستخدم فوراً من الذاكرة الحية عبر gRPC"""
     cmd = [
         XRAY_BIN, "api", "rmu",
         f"--server={XRAY_API_SERVER}",
         f"-tag={XRAY_INBOUND_TAG}",
         str(user_id)
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return res.returncode == 0
+
+
+def xray_api_add_user(user_id, uuid_str):
+    """إعادة إضافة المستخدم للذاكرة الحية فوراً عبر gRPC دون إعادة تشغيل السيرفر"""
+    client_spec = json.dumps({
+        "email": str(user_id),
+        "id": str(uuid_str).strip().lower(),
+        "level": 0
+    })
+    cmd = [
+        XRAY_BIN, "api", "adu",
+        f"--server={XRAY_API_SERVER}",
+        f"-tag={XRAY_INBOUND_TAG}",
+        client_spec
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return res.returncode == 0
 
 
 # ==============================================================================
-# كشف العناوين المتعددة (Anti Account-Sharing)
+# كشف العناوين المتعددة ومراقبة النشاط أثناء الحظر
 # ==============================================================================
 ips_seen = defaultdict(dict)
 ips_lock = threading.Lock()
+
+# user_id -> {"unblock_at": float, "attempts_during_ban": int, "last_attempt_ip": str}
 blocked_users = {}
 blocked_lock = threading.Lock()
 
 
-def kick_and_block(user_id, active_prefixes):
-    now = time.time()
+def kick_and_block(user_id, active_prefixes, trigger_time):
     with blocked_lock:
-        if now < blocked_users.get(user_id, 0):
+        if trigger_time < blocked_users.get(user_id, {}).get("unblock_at", 0):
             return
-        blocked_users[user_id] = now + BLOCK_DURATION
+        blocked_users[user_id] = {
+            "unblock_at": trigger_time + BLOCK_DURATION,
+            "attempts_during_ban": 0,
+            "last_attempt_ip": None
+        }
 
-    # طرد فوري للمستخدم لحظة الرصد
+    # إزالة المعرف فوراً من Xray
     xray_api_remove_user(user_id)
 
     with ips_lock:
@@ -208,36 +252,47 @@ def kick_and_block(user_id, active_prefixes):
         f"👤 المعرف (ID): <code>{user_id}</code>\n"
         f"🌐 عدد الأجهزة: {len(active_prefixes)}\n"
         f"📋 الشبكات: <code>{', '.join(active_prefixes)}</code>\n"
-        f"⛔ تم قطع الاتصال فوراً وحظر الحساب مؤقتاً."
+        f"⛔ تم قطع الاتصال وحظر الحساب مؤقتاً لمدة {BLOCK_DURATION} ثانية."
     )
 
 
-def handle_new_connection(user_id, ip):
+def handle_new_connection(user_id, ip, log_ts):
     now = time.time()
+
+    # 1. إهمال الأسطر القديمة في السجل (أكثر من 5 ثوانٍ)
+    if (now - log_ts) > 5.0:
+        return
+
+    # 2. فحص محاولات الاتصال أثناء سريان الحظر
     with blocked_lock:
-        if now < blocked_users.get(user_id, 0):
-            return
+        if user_id in blocked_users:
+            b_info = blocked_users[user_id]
+            if log_ts < b_info["unblock_at"]:
+                b_info["attempts_during_ban"] += 1
+                b_info["last_attempt_ip"] = ip
+                log(f"⚠️ [BAN ACTIVITY] User {user_id} requested connection DURING ban (Attempt #{b_info['attempts_during_ban']}) from IP: {ip}")
+                return
 
     prefix = get_network_prefix(ip)
 
+    # 3. تتبع وتحديث الشبكات النشطة خلال نافذة الوقت (IP_TTL_SECONDS)
     with ips_lock:
         table = ips_seen[user_id]
 
-        # تنظيف الشبكات القديمة بعد انقضاء نافذة الوقت
         for old_prefix in list(table.keys()):
-            if now - table[old_prefix] > IP_TTL_SECONDS:
+            if log_ts - table[old_prefix] > IP_TTL_SECONDS:
                 del table[old_prefix]
 
-        table[prefix] = now
+        table[prefix] = log_ts
         active_prefixes = list(table.keys())
 
-    # الحظر يقع فقط إذا وُجد نطاقان مختلفان كلياً في نفس الوقت (مثل 129.45 و 105.235)
+    # إذا ظهرت شبكتان مختلفتان تماماً في نفس النافذة يتم الحظر
     if len(active_prefixes) > 1:
-        kick_and_block(user_id, active_prefixes)
+        kick_and_block(user_id, active_prefixes, log_ts)
 
 
 def access_log_reader():
-    """قراءة مستمرة للأمام فقط بدون تصفير أو إعادة ترجيع للمؤشر"""
+    """قراءة مستمرة للأمام فقط بدون تصفير أو تراجع للمؤشر"""
     while not os.path.exists(XRAY_ACCESS_LOG):
         time.sleep(0.3)
 
@@ -260,44 +315,51 @@ def access_log_reader():
 
                 ip = m.group("ip").strip("[]")
                 user_id = m.group("user_id")
+                log_time_raw = m.group("log_time")
 
                 if ip in ("127.0.0.1", "::1"):
                     continue
 
-                handle_new_connection(user_id, ip)
+                log_ts = parse_log_time(log_time_raw)
+                handle_new_connection(user_id, ip, log_ts)
     except Exception as exc:
         log(f"access_log_reader error: {exc}")
         time.sleep(0.5)
 
 
 def unblock_worker():
-    """إعادة تشغيل Xray السريعة محصورة فقط عند فك الحظر لإرجاع المستخدمين"""
+    """فك الحظر لحظياً عبر gRPC وإشعار المستخدم بحالة نشاطه"""
     while True:
         now = time.time()
         to_unblock = []
+
         with blocked_lock:
-            for user_id, unblock_time in list(blocked_users.items()):
-                if now >= unblock_time:
-                    to_unblock.append(user_id)
+            for user_id, info in list(blocked_users.items()):
+                if now >= info["unblock_at"]:
+                    to_unblock.append((user_id, info["attempts_during_ban"]))
                     del blocked_users[user_id]
 
         if to_unblock:
             users = get_all_users()
-            with blocked_lock:
-                currently_blocked = set(str(k) for k in blocked_users)
+            for user_id, attempts in to_unblock:
+                uuid_str = users.get(str(user_id), {}).get("uuid")
+                if uuid_str:
+                    # إعادة تفعيل الحساب ديناميكياً بدون ريستارت
+                    xray_api_add_user(user_id, uuid_str)
 
-            # إعادة تشغيل عادية وسريعة لإعادة تحميل المستخدمين
-            restart_xray(users, blocked_set=currently_blocked)
+                with ips_lock:
+                    ips_seen.pop(user_id, None)
 
-            with ips_lock:
-                for uid in to_unblock:
-                    ips_seen.pop(uid, None)
+                if attempts > 0:
+                    status_note = f"⚠️ تم تسجيل <b>{attempts}</b> محاولة اتصال أثناء فترة الحظر."
+                else:
+                    status_note = "🟢 لم تُسجل أي محاولات اتصال أثناء الحظر."
 
-            for user_id in to_unblock:
-                log(f"✅ Ban lifted: {user_id}")
+                log(f"✅ Unblocked via gRPC: {user_id} | Attempts: {attempts}")
                 send_telegram(
                     f"✅ <b>انتهى الحظر المؤقت للحساب:</b>\n<code>{user_id}</code>\n"
-                    f"🔄 يمكنك معاودة الاتصال الآن بأمان."
+                    f"{status_note}\n\n"
+                    f"🔄 تمت استعادة الخدمة الآن."
                 )
 
         time.sleep(1)
