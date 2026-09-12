@@ -19,7 +19,7 @@ import grpc
 import redis
 
 # =============================================================================
-# الإعدادات الأساسية
+# 1. الإعدادات الأساسية
 # =============================================================================
 
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -37,19 +37,19 @@ XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1").rstrip("/")
 
 # فترات الحظر
-BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))       # حظر عادي (ثوانٍ)
-LONG_BLOCK_DURATION = int(os.environ.get("LONG_BLOCK_DURATION", "10800"))   # حظر 3 ساعات (10800 ثانية)
-MAX_STRIKES = int(os.environ.get("MAX_STRIKES", "5"))                       # الحد الأقصى للمخالفات
+BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))        # الحظر العادي (ثوانٍ)
+LONG_BLOCK_DURATION = int(os.environ.get("LONG_BLOCK_DURATION", "10800"))    # حظر 3 ساعات (10800 ثانية)
+MAX_STRIKES = int(os.environ.get("MAX_STRIKES", "5"))                        # الحد الأقصى للمخالفات
 
 IP_TTL_SECONDS = max(2, int(os.environ.get("IP_TTL_SECONDS", "12")))
 SYNC_INTERVAL = max(2, int(os.environ.get("SYNC_INTERVAL", "10")))
 BAN_CHECK_INTERVAL = 1.0
 
-# ضبط دقيق للشبكات لمنع الحظر الخاطئ:
-# IPv4 على /24 للتمييز الدقيق بين شرائح الهاتف
-# IPv6 على /32 لتوحيد خوادم Meta ومزودي الخدمة في شبكة واحدة
-V4_PREFIX = min(32, max(8, int(os.environ.get("V4_PREFIX", "24"))))
-V6_PREFIX = min(128, max(32, int(os.environ.get("V6_PREFIX", "32"))))
+# تثبيت الأقنعة الصارمة:
+# IPv4: تثبيت أول 3 أرقام (A.B.C) وتجاهل الأخير
+# IPv6: تثبيت أول خانتين (/32) لتوحيد خوادم Meta ومزودي الخدمة
+V4_PREFIX = 24
+V6_PREFIX = 32
 
 IGNORED_NETWORKS = os.environ.get("IGNORED_NETWORKS", "")
 
@@ -85,12 +85,10 @@ ZERO_V6 = ipaddress.ip_network("::/8")
 
 
 # =============================================================================
-# نظام إشعارات Telegram غير المتزامن مع حماية ضد التكرار (Debounce)
+# 2. نظام إشعارات Telegram (حظر وفك حظر فقط)
 # =============================================================================
 
-notifications = queue.Queue(maxsize=150)
-recent_alerts = {}
-alerts_lock = threading.Lock()
+notifications = queue.Queue(maxsize=200)
 
 
 def notify(text):
@@ -100,17 +98,6 @@ def notify(text):
         notifications.put_nowait(text)
     except queue.Full:
         log("Telegram queue full; notification skipped")
-
-
-def notify_debounced(key, text, cooldown=30):
-    """إرسال تنبيه مع منع تكراره لنفس المفتاح لمدة زمنية محددة لمنع السبام"""
-    now = time.time()
-    with alerts_lock:
-        last = recent_alerts.get(key, 0)
-        if now - last < cooldown:
-            return
-        recent_alerts[key] = now
-    notify(text)
 
 
 def notification_worker():
@@ -133,7 +120,7 @@ def notification_worker():
 
 
 # =============================================================================
-# اتصال Redis
+# 3. إدارة المستخدمين والحالات في Redis
 # =============================================================================
 
 r = redis.from_url(
@@ -198,7 +185,7 @@ def get_ban_tokens(users):
 
 
 # =============================================================================
-# فحص وتطبيع الشبكات
+# 4. تطبيع واقتطاع الشبكات (IPv4 على /24 و IPv6 على /32)
 # =============================================================================
 
 def normalize_source(raw_ip):
@@ -226,8 +213,14 @@ def normalize_source(raw_ip):
 
 
 def network_key(address):
-    prefix = V4_PREFIX if address.version == 4 else V6_PREFIX
-    return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
+    try:
+        if address.version == 4:
+            parts = str(address).split(".")
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        else:
+            return str(ipaddress.ip_network(f"{address}/{V6_PREFIX}", strict=False))
+    except Exception:
+        return str(address)
 
 
 def is_ignored(address):
@@ -238,7 +231,7 @@ def is_ignored(address):
 
 
 # =============================================================================
-# قرار الحظر الذري مع نظام الـ 5 مخالفات
+# 5. قرار الحظر الذري مع احتساب المخالفات (Redis Lua)
 # =============================================================================
 
 DETECT_LUA = """
@@ -269,11 +262,12 @@ local networks = redis.call('ZRANGE', KEYS[1], 0, -1)
 
 if #networks > 1 then
     local strikes = redis.call('INCR', KEYS[3])
-    redis.call('EXPIRE', KEYS[3], 86400)
+    redis.call('EXPIRE', KEYS[3], 86400) -- حفظ العداد لـ 24 ساعة
 
     local ban_time = base_duration
     local is_long_ban = 0
 
+    -- عند الوصول لـ 5 مخالفات: حظر 3 ساعات وتصفير العداد
     if strikes >= max_strikes then
         ban_time = long_duration
         is_long_ban = 1
@@ -327,12 +321,12 @@ def observe_network(user_id, address, age):
 
             log(
                 f"🚨 BAN_TRIGGERED uid={user_id!r} duration={ban_time}s "
-                f"strikes={strikes} networks={detected_networks!r}"
+                f"strikes={strikes} long_ban={is_long_ban} networks={detected_networks!r}"
             )
 
             if is_long_ban:
                 notify(
-                    "🚨 <b>عقوبة مشددة: حظر الحساب لمدة 3 ساعات كاملة!</b>\n"
+                    "🚨 <b>عقوبة مشددة: تم حظر الحساب لمدة 3 ساعات!</b>\n"
                     f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
                     f"⚠️ السبب: استنفاد الحد الأقصى للمخالفات (<b>{MAX_STRIKES} مرات</b>).\n"
                     f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
@@ -346,7 +340,7 @@ def observe_network(user_id, address, age):
                     f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
                     f"⏱ المدة: {ban_time} ثانية\n"
                     f"⚠️ تنبيه المخالفات: [ <b>{strikes}</b> / {MAX_STRIKES} ]\n"
-                    f"<i>ملاحظة: عند الوصول للمخالفة 5 يتم الحظر لـ 3 ساعات.</i>"
+                    f"<i>ملاحظة: عند تكرار المخالفة 5 مرات سيتم حظر الحساب تلقائياً لمدة 3 ساعات.</i>"
                 )
 
     except Exception as exc:
@@ -354,7 +348,7 @@ def observe_network(user_id, address, age):
 
 
 # =============================================================================
-# gRPC: إضافة المستخدم الحية (بدون أخطاء سطر الأوامر)
+# 6. إدارة مستخدمي Xray المباشرة عبر gRPC
 # =============================================================================
 
 def encode_varint(value):
@@ -387,7 +381,6 @@ grpc_alter_inbound = grpc_channel.unary_unary(
 
 
 def add_user(user_id, user_uuid):
-    """إضافة المستخدم فوراً لذاكرة Xray عبر بروتوكول gRPC الصريح"""
     try:
         account = typed_message(
             "xray.proxy.vless.Account",
@@ -409,7 +402,6 @@ def add_user(user_id, user_uuid):
 
 
 def remove_user(user_id):
-    """طرد المستخدم فوراً من ذاكرة Xray عبر أمر rmu الرسمي"""
     command = [
         XRAY_BIN,
         "api",
@@ -430,7 +422,7 @@ def remove_user(user_id):
 
 
 # =============================================================================
-# تشغيل خادم Xray
+# 7. تشغيل خادم Xray
 # =============================================================================
 
 def start_xray(users):
@@ -504,7 +496,7 @@ def start_xray(users):
 
 
 # =============================================================================
-# قراءة سجل الوصول مع التنبيه بعد الاتصال
+# 8. قراءة سجل الوصول ورصد النشاط
 # =============================================================================
 
 ACCESS_RE = re.compile(
@@ -576,22 +568,6 @@ def access_log_reader():
         if address is None or is_ignored(address):
             continue
 
-        # 1. إشعار بعد الاتصال في الـ Log
-        net = network_key(address)
-        log(f"🟢 [XRAY_ACCEPTED] uid={uid} | ip={raw_ip} | net={net}")
-
-        # 2. إرسال إلى تيليجرام (مفلترة لمنع السبام: رسالة واحدة لكل مستخدم/آيبي كل دقيقة)
-        tg_key = f"xray_conn:{uid}:{net}"
-        notify_debounced(
-            tg_key,
-            f"🟢 <b>اتصال مؤكد (بعد الاتصال - Xray)</b>\n"
-            f"👤 المعرف: <code>{html.escape(uid)}</code>\n"
-            f"🌐 الآيبي: <code>{html.escape(raw_ip)}</code>\n"
-            f"🏷️ الشبكة المحسوبة: <code>{html.escape(net)}</code>\n"
-            f"⏰ التوقيت: <code>{datetime.now().strftime('%H:%M:%S')}</code>",
-            cooldown=60
-        )
-
         age = time.time() - event_ts
         if age < -10 or age > (IP_TTL_SECONDS * 3):
             continue
@@ -600,45 +576,7 @@ def access_log_reader():
 
 
 # =============================================================================
-# تشخيص proxy.py: التنبيه قبل الاتصال
-# =============================================================================
-
-def install_proxy_diagnostics(proxy_module):
-    original_get_ip = proxy_module.ProxyHandler._get_client_ip
-
-    def diagnosed(handler, headers, client):
-        selected_ip = original_get_ip(handler, headers, client)
-
-        try:
-            peer = client.getpeername()[0]
-        except Exception:
-            peer = "unknown"
-
-        xff = headers.get("x-forwarded-for", "NONE")
-        host = headers.get("host", "NONE")
-
-        # 1. طباعة كاملة في الـ Log
-        log(f"📡 [PROXY_INCOMING] peer={peer} | selected={selected_ip} | xff={xff[:120]} | host={host}")
-
-        # 2. إرسال إلى تيليجرام (مفلترة لمنع السبام: رسالة لكل آيبي كل 30 ثانية)
-        tg_key = f"proxy_in:{selected_ip}"
-        notify_debounced(
-            tg_key,
-            f"📡 <b>طلب اتصال وارد (قبل الاتصال - Proxy)</b>\n"
-            f"🌐 الآيبي المستخرج: <code>{html.escape(selected_ip)}</code>\n"
-            f"🔗 المصدر المباشر (Peer): <code>{html.escape(peer)}</code>\n"
-            f"📋 ترويسة X-Forwarded-For:\n<code>{html.escape(xff[:150])}</code>\n"
-            f"🌍 الهوست: <code>{html.escape(host)}</code>",
-            cooldown=30
-        )
-
-        return selected_ip
-
-    proxy_module.ProxyHandler._get_client_ip = diagnosed
-
-
-# =============================================================================
-# مزامنة الحالة وتطبيق القرارات
+# 9. مزامنة الحالة وتطبيق الحظر وفك الحظر
 # =============================================================================
 
 def reconcile_users(loaded, desired, banned):
@@ -671,7 +609,7 @@ def announce_local_restoration(user_id, ban_token):
 
 
 # =============================================================================
-# التشغيل الرئيسي
+# 10. التشغيل الرئيسي
 # =============================================================================
 
 def main():
@@ -704,7 +642,6 @@ def main():
 
     try:
         import proxy
-        install_proxy_diagnostics(proxy)
 
         reader_thread = threading.Thread(target=access_log_reader, daemon=True)
         proxy_thread = threading.Thread(target=proxy.main, daemon=True)
