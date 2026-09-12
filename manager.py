@@ -15,7 +15,6 @@ import uuid
 from datetime import datetime, timezone
 from urllib import parse, request
 
-import grpc
 import redis
 
 
@@ -28,8 +27,6 @@ if not REDIS_URL:
     raise RuntimeError("Missing environment variable: REDIS_URL")
 
 REDIS_USERS_KEY = os.environ.get("REDIS_USERS_KEY", "users:data")
-
-# يجب أن تكون نفس القيمة في جميع الحاويات لنفس مجموعة المستخدمين.
 STATE_NAMESPACE = os.environ.get("STATE_NAMESPACE", "corazon:netban:v3")
 
 XRAY_BIN = "/usr/local/bin/xray"
@@ -39,25 +36,22 @@ XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1").rstrip("/")
 
-BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))
+# فترات الحظر
+BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))       # الحظر العادي (ثوانٍ)
+LONG_BLOCK_DURATION = int(os.environ.get("LONG_BLOCK_DURATION", "10800"))   # حظر 3 ساعات (10800 ثانية)
+MAX_STRIKES = int(os.environ.get("MAX_STRIKES", "5"))                       # الحد الأقصى للمخالفات
+
 IP_TTL_SECONDS = max(2, int(os.environ.get("IP_TTL_SECONDS", "12")))
 SYNC_INTERVAL = max(2, int(os.environ.get("SYNC_INTERVAL", "10")))
 BAN_CHECK_INTERVAL = 1.0
 DIAG_SAMPLES = max(0, int(os.environ.get("DIAG_SAMPLES", "10")))
 
-# IPv4: 16 => تجاهل الخانتين الأخيرتين.
-# IPv6: 64 => تجاهل آخر أربع مجموعات.
-V4_PREFIX = min(32, max(8, int(os.environ.get("V4_PREFIX", "16"))))
+# ضبط أقنعة الشبكات (IPv4 على /24 للتمييز بين شرائح 4G المختلفة)
+V4_PREFIX = min(32, max(8, int(os.environ.get("V4_PREFIX", "24"))))
 V6_PREFIX = min(128, max(48, int(os.environ.get("V6_PREFIX", "64"))))
 
-# نطاقات بنية Meta/فيسبوك: تظهر كعناوين مصدر ولا تمثل هاتف المستخدم.
-# يمكن تعطيل الاستثناء بجعل القيمة سلسلة فارغة IGNORED_NETWORKS="".
-DEFAULT_IGNORED = (
-    "2a03:2880::/32,2620:0:1c00::/40,"
-    "66.220.0.0/16,173.252.0.0/16,157.240.0.0/16,"
-    "31.13.0.0/16,129.134.0.0/16,185.60.216.0/22,179.60.192.0/22"
-)
-IGNORED_NETWORKS = os.environ.get("IGNORED_NETWORKS", DEFAULT_IGNORED)
+# شبكات مستثناة (فارغة افتراضياً لمنع تفويت أي جهاز)
+IGNORED_NETWORKS = os.environ.get("IGNORED_NETWORKS", "")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -94,7 +88,7 @@ ZERO_V6 = ipaddress.ip_network("::/8")
 
 
 # =============================================================================
-# Telegram خارج خيط قراءة السجل
+# نظام إشعارات Telegram غير المتزامن
 # =============================================================================
 
 notifications = queue.Queue(maxsize=100)
@@ -113,10 +107,7 @@ def notification_worker():
     while True:
         text = notifications.get()
         try:
-            url = (
-                "https://api.telegram.org/bot"
-                f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-            )
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             body = parse.urlencode({
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
@@ -132,7 +123,7 @@ def notification_worker():
 
 
 # =============================================================================
-# Redis
+# اتصال Redis
 # =============================================================================
 
 r = redis.from_url(
@@ -151,10 +142,6 @@ def state_base(user_id):
 
 
 def get_users():
-    """
-    dict عند نجاح القراءة، و None عند الفشل أو وجود بيانات غير صالحة.
-    None يعني: أبقِ القائمة السابقة.
-    """
     try:
         records = r.hgetall(REDIS_USERS_KEY)
         users = {}
@@ -178,12 +165,8 @@ def get_users():
             users[user_id] = user_uuid
 
         return users
-
     except Exception as exc:
-        log(
-            f"Redis user snapshot failed: {type(exc).__name__}; "
-            "previous users retained"
-        )
+        log(f"Redis user snapshot failed: {type(exc).__name__}; previous users retained")
         return None
 
 
@@ -192,7 +175,6 @@ def get_ban_tokens(users):
         return {}
 
     user_ids = list(users)
-
     with r.pipeline(transaction=False) as pipe:
         for uid in user_ids:
             pipe.get(f"{state_base(uid)}:ban")
@@ -206,15 +188,10 @@ def get_ban_tokens(users):
 
 
 # =============================================================================
-# تطبيع عنوان المصدر
+# تطبيع وفحص العناوين
 # =============================================================================
 
 def normalize_source(raw_ip):
-    """
-    يرجع (address, reason):
-      address: كائن عنوان صالح، أو None.
-      reason: None عند النجاح أو سبب الرفض.
-    """
     try:
         address = ipaddress.ip_address(raw_ip)
     except ValueError:
@@ -226,7 +203,6 @@ def normalize_source(raw_ip):
         elif address.is_loopback or address.is_unspecified:
             return None, None
         elif address in ZERO_V6:
-            # مثل ::2a03:2880:... وهي ليست عنوان مصدر عام صالح.
             return None, "suspicious-zero-prefix"
 
     if address.is_loopback or address.is_unspecified:
@@ -252,38 +228,40 @@ def is_ignored(address):
 
 
 # =============================================================================
-# قرار الحظر الذري في Redis
+# قرار الحظر الذري مع نظام الـ 5 مخالفات
 # =============================================================================
 
 # KEYS:
-# 1: الشبكات المرصودة
-# 2: الحظر المؤقت
-# 3: أقل وقت حدث مسموح به
+# 1: الشبكات المرصودة ({base}:networks)
+# 2: الحظر المؤقت ({base}:ban)
+# 3: عداد المخالفات ({base}:strikes)
 #
 # ARGV:
 # 1: مفتاح الشبكة
-# 2: نافذة الرصد
-# 3: مدة الحظر
+# 2: نافذة الرصد (IP_TTL_SECONDS)
+# 3: مدة الحظر العادي
 # 4: عمر الحدث
 # 5: توكن الحظر
+# 6: مدة الحظر المشدد (3 ساعات)
+# 7: الحد الأقصى للمخالفات (5)
 
 DETECT_LUA = """
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
 local window = tonumber(ARGV[2])
-local duration = tonumber(ARGV[3])
+local base_duration = tonumber(ARGV[3])
 local age = tonumber(ARGV[4])
+local token = ARGV[5]
+local long_duration = tonumber(ARGV[6])
+local max_strikes = tonumber(ARGV[7])
 local event_time = now - age
 
+-- إذا كان المستخدم محظوراً حالياً لا نفعل شيئاً
 if redis.call('EXISTS', KEYS[2]) == 1 then
     return {}
 end
 
-local ignore_before = tonumber(redis.call('GET', KEYS[3]) or '0')
-if event_time <= ignore_before then
-    return {}
-end
-
+-- تنظيف السجلات الأقدم من نافذة الرصد
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
 
 local previous = redis.call('ZSCORE', KEYS[1], ARGV[1])
@@ -295,18 +273,28 @@ redis.call('EXPIRE', KEYS[1], math.ceil(window * 3))
 
 local networks = redis.call('ZRANGE', KEYS[1], 0, -1)
 
+-- تحقق من تعدد الشبكات
 if #networks > 1 then
-    local created = redis.call(
-        'SET', KEYS[2], ARGV[5], 'NX', 'EX', duration
-    )
+    local strikes = redis.call('INCR', KEYS[3])
+    redis.call('EXPIRE', KEYS[3], 86400) -- حفظ العداد لمدة 24 ساعة
 
+    local ban_time = base_duration
+    local is_long_ban = 0
+
+    if strikes >= max_strikes then
+        ban_time = long_duration
+        is_long_ban = 1
+        redis.call('SET', KEYS[3], 0) -- تصفير العداد بعد تطبيق العقوبة القصوى
+    end
+
+    local created = redis.call('SET', KEYS[2], token, 'NX', 'EX', ban_time)
     if created then
-        redis.call(
-            'SET', KEYS[3], tostring(now + duration),
-            'EX', math.ceil(duration + window + 60)
-        )
         redis.call('DEL', KEYS[1])
-        return networks
+        local result = { tostring(ban_time), tostring(strikes), tostring(is_long_ban) }
+        for i, net in ipairs(networks) do
+            table.insert(result, net)
+        end
+        return result
     end
 end
 
@@ -321,11 +309,11 @@ def observe_network(user_id, address, age):
         base = state_base(user_id)
         token = uuid.uuid4().hex
 
-        networks = detect_script(
+        res = detect_script(
             keys=[
                 f"{base}:networks",
                 f"{base}:ban",
-                f"{base}:ignore_before",
+                f"{base}:strikes",
             ],
             args=[
                 network_key(address),
@@ -333,102 +321,79 @@ def observe_network(user_id, address, age):
                 BLOCK_DURATION,
                 max(0.0, age),
                 token,
+                LONG_BLOCK_DURATION,
+                MAX_STRIKES,
             ],
         )
 
-        if networks:
+        if res:
+            ban_time = int(res[0])
+            strikes = int(res[1])
+            is_long_ban = (res[2] == "1")
+            detected_networks = res[3:]
+
             log(
                 f"BAN_CREATED uid={user_id!r} token={token} "
-                f"duration={BLOCK_DURATION}s networks={networks!r}"
+                f"duration={ban_time}s strikes={strikes} long_ban={is_long_ban} "
+                f"networks={detected_networks!r}"
             )
 
-            notify(
-                "⛔ <b>تم تسجيل حظر مؤقت للحساب</b>\n"
-                f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
-                f"🌐 الشبكات: "
-                f"<code>{html.escape(', '.join(networks[:8]))}</code>\n"
-                f"⏱ المدة: {BLOCK_DURATION} ثانية\n"
-                "السبب: ظهور شبكتَي مصدر مختلفتين ضمن نافذة الرصد.\n"
-                "يجري تطبيق الحظر على الحاويات."
-            )
+            if is_long_ban:
+                notify(
+                    "🚨 <b>عقوبة قصوى: حظر الحساب لمدة 3 ساعات!</b>\n"
+                    f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
+                    f"⚠️ السبب: استنفاد الحد الأقصى للمخالفات (<b>{MAX_STRIKES} مرات</b>).\n"
+                    f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
+                    "⏱ المدة: <b>3 ساعات (180 دقيقة)</b>\n"
+                    "⛔ تم فصل الاتصال وإيقاف الخدمة حتى انتهاء المدة."
+                )
+            else:
+                notify(
+                    "⛔ <b>تم تسجيل حظر مؤقت للحساب</b>\n"
+                    f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
+                    f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
+                    f"⏱ المدة: {ban_time} ثانية\n"
+                    f"⚠️ تنبيه المخالفات: [ <b>{strikes}</b> / {MAX_STRIKES} ]\n"
+                    f"<i>ملاحظة: عند تكرار المخالفة 5 مرات سيتم حظر الحساب تلقائياً لمدة 3 ساعات كاملة.</i>"
+                )
 
     except Exception as exc:
         log(f"IP detection failed: {type(exc).__name__}")
 
 
 # =============================================================================
-# gRPC: إضافة المستخدم
+# إضافة وحذف المستخدمين عبر أوامر Xray الرسمية
 # =============================================================================
 
-def encode_varint(value):
-    result = bytearray()
-    while value > 127:
-        result.append((value & 127) | 128)
-        value >>= 7
-    result.append(value)
-    return bytes(result)
-
-
-def bytes_field(number, value):
-    return (
-        encode_varint((number << 3) | 2)
-        + encode_varint(len(value))
-        + value
-    )
-
-
-def string_field(number, value):
-    return bytes_field(number, str(value).encode("utf-8"))
-
-
-def typed_message(type_name, payload):
-    return string_field(1, type_name) + bytes_field(2, payload)
-
-
-grpc_channel = grpc.insecure_channel(XRAY_API_SERVER)
-
-grpc_alter_inbound = grpc_channel.unary_unary(
-    "/xray.app.proxyman.command.HandlerService/AlterInbound",
-    request_serializer=lambda value: value,
-    response_deserializer=lambda value: value,
-)
-
-
 def add_user(user_id, user_uuid):
+    """إضافة المستخدم فوراً لذاكرة Xray عبر JSON CLI الرسمي"""
+    client_spec = json.dumps({
+        "email": str(user_id),
+        "id": str(user_uuid).strip().lower(),
+        "level": 0,
+    })
+    command = [
+        XRAY_BIN,
+        "api",
+        "adu",
+        f"--server={XRAY_API_SERVER}",
+        f"-tag={XRAY_INBOUND_TAG}",
+        client_spec,
+    ]
     try:
-        account = typed_message(
-            "xray.proxy.vless.Account",
-            string_field(1, user_uuid),
-        )
-        user_message = (
-            string_field(2, user_id) + bytes_field(3, account)
-        )
-        operation = typed_message(
-            "xray.app.proxyman.command.AddUserOperation",
-            bytes_field(1, user_message),
-        )
-        payload = (
-            string_field(1, XRAY_INBOUND_TAG)
-            + bytes_field(2, operation)
-        )
-
-        grpc_alter_inbound(payload, timeout=5)
-        log(f"API_ADD_OK uid={user_id!r}")
-        return True
-
-    except grpc.RpcError as exc:
-        log(
-            f"API_ADD_FAILED uid={user_id!r} "
-            f"code={exc.code()} details={exc.details()!r}"
-        )
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            log(f"API_ADD_OK uid={user_id!r}")
+            return True
+        log(f"API_ADD_FAILED uid={user_id!r}: {result.stderr.strip() or result.stdout.strip()}")
+        return False
+    except Exception as exc:
+        log(f"API_ADD_FAILED uid={user_id!r}: {exc}")
         return False
 
 
-# =============================================================================
-# الحذف بالأمر القديم: xray api rmu
-# =============================================================================
-
 def remove_user(user_id):
+    """طرد المستخدم فوراً من ذاكرة Xray"""
     command = [
         XRAY_BIN,
         "api",
@@ -437,42 +402,15 @@ def remove_user(user_id):
         f"-tag={XRAY_INBOUND_TAG}",
         str(user_id),
     ]
-
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        log(f"API_REMOVE_FAILED uid={user_id!r}: timeout")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            log(f"API_REMOVE_OK uid={user_id!r}")
+            return True
         return False
-    except OSError as exc:
-        log(
-            f"API_REMOVE_FAILED uid={user_id!r}: "
-            f"{type(exc).__name__}"
-        )
+    except Exception as exc:
+        log(f"API_REMOVE_FAILED uid={user_id!r}: {exc}")
         return False
-
-    if result.returncode != 0:
-        details = (
-            result.stderr.strip()
-            or result.stdout.strip()
-            or "No details"
-        )
-        log(
-            f"API_REMOVE_FAILED uid={user_id!r} "
-            f"exit={result.returncode} details={details[:1500]!r}"
-        )
-        return False
-
-    log(
-        f"API_REMOVE_OK uid={user_id!r}; "
-        "existing tunnel closure not verified"
-    )
-    return True
 
 
 # =============================================================================
@@ -528,73 +466,46 @@ def start_xray(users):
     }
 
     os.makedirs(os.path.dirname(XRAY_CONFIG_PATH), exist_ok=True)
-
     with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as file:
         json.dump(config, file)
 
-    process = subprocess.Popen([
-        XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH,
-    ])
+    process = subprocess.Popen([XRAY_BIN, "run", "-config", XRAY_CONFIG_PATH])
 
-    try:
-        grpc.channel_ready_future(grpc_channel).result(timeout=15)
-
-        deadline = time.monotonic() + 10
-        while True:
-            if process.poll() is not None:
-                raise RuntimeError("Xray exited during startup")
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", 5000), timeout=0.5
-                ):
-                    break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("Xray port 5000 is not ready")
-                time.sleep(0.2)
-
-    except Exception:
-        process.terminate()
+    deadline = time.monotonic() + 10
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError("Xray exited during startup")
         try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        raise
+            with socket.create_connection(("127.0.0.1", 5000), timeout=0.5):
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Xray port 5000 is not ready")
+            time.sleep(0.2)
 
     log(f"XRAY_READY users={len(users)}")
     return process
 
 
 # =============================================================================
-# قراءة سجل الوصول
+# قراءة سجل الوصول بنمط استخراج مرن
 # =============================================================================
 
 ACCESS_RE = re.compile(
-    r"^(?P<ts>\d{4}/\d{2}/\d{2}\s+"
-    r"\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?)\s+"
-    r"(?:from\s+)?"
-    r"(?:(?:tcp|udp):)?"
-    r"(?P<ip>\[[0-9a-fA-F:.]+\]|[0-9a-fA-F:.]+)"
-    r":(?P<port>\d+)\s+"
-    r"accepted\s+.*?\bemail:\s*(?P<uid>\S+)"
+    r"(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?).*?"
+    r"(?:(?:tcp|udp):)?\[?(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]+)\]?:\d+\s+"
+    r"accepted.*?\bemail:\s*(?P<uid>\S+)"
 )
 
 
 def parse_event_time(value):
     base, dot, fraction = value.partition(".")
     base = " ".join(base.split())
-    parsed = datetime.strptime(
-        base, "%Y/%m/%d %H:%M:%S"
-    ).replace(tzinfo=timezone.utc)
+    parsed = datetime.strptime(base, "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
     return parsed.timestamp() + (float("0." + fraction) if dot else 0)
 
 
 def access_log_reader():
-    samples_left = DIAG_SAMPLES
-    rejected_logged = 0
-    ignored_logged = 0
-    parse_warn_at = 0.0
     handle = None
     identity = None
 
@@ -620,73 +531,46 @@ def access_log_reader():
         raw = handle.readline()
 
         if not raw:
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
 
         if not raw.endswith(b"\n"):
             handle.seek(position)
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
 
         line = raw.decode("utf-8", "replace")
 
-        if samples_left > 0:
-            log(f"XRAY_RAW {line.rstrip()[:2000]!r}")
-            samples_left -= 1
-
         if "accepted" not in line or "email:" not in line:
             continue
 
-        match = ACCESS_RE.match(line)
-
+        match = ACCESS_RE.search(line)
         if not match:
-            if time.monotonic() - parse_warn_at > 60:
-                log(
-                    "ACCESS_PARSE_MISS: unsupported line format; "
-                    "line ignored, no current-time fallback"
-                )
-                parse_warn_at = time.monotonic()
             continue
 
         try:
             event_ts = parse_event_time(match.group("ts"))
         except (ValueError, OverflowError):
-            continue
+            event_ts = time.time()
 
         uid = match.group("uid")
         raw_ip = match.group("ip").strip("[]")
 
         address, reason = normalize_source(raw_ip)
-
-        if address is None:
-            if reason and rejected_logged < DIAG_SAMPLES:
-                log(
-                    f"SOURCE_REJECTED reason={reason} uid={uid!r} "
-                    f"raw_ip={raw_ip!r} "
-                    f"raw_line={line.rstrip()[:1500]!r}"
-                )
-                rejected_logged += 1
-            continue
-
-        if is_ignored(address):
-            if ignored_logged < DIAG_SAMPLES:
-                log(
-                    f"SOURCE_IGNORED uid={uid!r} ip={str(address)!r} "
-                    f"raw_line={line.rstrip()[:1500]!r}"
-                )
-                ignored_logged += 1
+        if address is None or is_ignored(address):
             continue
 
         age = time.time() - event_ts
 
-        if age < -2 or age > IP_TTL_SECONDS:
+        # استبعاد السطور القديمة جداً مع السماح بهامش تفاوت التوقيت
+        if age < -10 or age > (IP_TTL_SECONDS * 3):
             continue
 
         observe_network(uid, address, age)
 
 
 # =============================================================================
-# تشخيص proxy.py الحالي
+# تشخيص proxy.py
 # =============================================================================
 
 def install_proxy_diagnostics(proxy_module):
@@ -696,33 +580,20 @@ def install_proxy_diagnostics(proxy_module):
 
     def diagnosed(handler, headers, client):
         nonlocal remaining
-
-        xff = headers.get("x-forwarded-for", "")
         selected = original(handler, headers, client)
-
         with lock:
             should_log = remaining > 0
             if should_log:
                 remaining -= 1
-
         if should_log:
-            try:
-                peer = client.getpeername()[0]
-            except Exception:
-                peer = "?"
-
-            log(
-                f"IP_DEBUG peer={peer!r} "
-                f"xff={xff[:500]!r} selected={selected!r}"
-            )
-
+            log(f"IP_DEBUG selected={selected!r}")
         return selected
 
     proxy_module.ProxyHandler._get_client_ip = diagnosed
 
 
 # =============================================================================
-# تطبيق الحالة محليًا
+# تطبيق ومزامنة الحالة
 # =============================================================================
 
 def reconcile_users(loaded, desired, banned):
@@ -746,13 +617,11 @@ def reconcile_users(loaded, desired, banned):
 
 def announce_local_restoration(user_id, ban_token):
     key = f"{state_base(user_id)}:restored:{ban_token}"
-
     if r.set(key, INSTANCE, nx=True, ex=3600):
         notify(
             "✅ <b>انتهت مدة الحظر</b>\n"
             f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
-            "تم التحقق من إتاحة الحساب في إحدى الحاويات.\n"
-            "بقية الحاويات تتابع المزامنة تلقائيًا."
+            "🔄 تم فك الحظر واستعادة الاتصال بنجاح."
         )
 
 
@@ -762,17 +631,13 @@ def announce_local_restoration(user_id, ban_token):
 
 def main():
     log(
-        f"MODE=NET_BAN duration={BLOCK_DURATION}s "
-        f"window={IP_TTL_SECONDS}s "
-        f"v4=/{V4_PREFIX} v6=/{V6_PREFIX} "
-        f"ignored={len(IGNORED_PARSED)} networks"
+        f"MODE=NET_BAN duration={BLOCK_DURATION}s long_duration={LONG_BLOCK_DURATION}s "
+        f"window={IP_TTL_SECONDS}s v4=/{V4_PREFIX} v6=/{V6_PREFIX}"
     )
 
     users = get_users()
     if users is None:
-        raise RuntimeError(
-            "Cannot start without a valid Redis user snapshot"
-        )
+        raise RuntimeError("Cannot start without a valid Redis user snapshot")
 
     initial_bans = get_ban_tokens(users)
     initial_allowed = {
@@ -784,9 +649,7 @@ def main():
     with open(XRAY_ACCESS_LOG, "w", encoding="utf-8"):
         pass
 
-    threading.Thread(
-        target=notification_worker, daemon=True,
-    ).start()
+    threading.Thread(target=notification_worker, daemon=True).start()
 
     xray_process = start_xray(initial_allowed)
 
@@ -798,12 +661,8 @@ def main():
         import proxy
         install_proxy_diagnostics(proxy)
 
-        reader_thread = threading.Thread(
-            target=access_log_reader, daemon=True,
-        )
-        proxy_thread = threading.Thread(
-            target=proxy.main, daemon=True,
-        )
+        reader_thread = threading.Thread(target=access_log_reader, daemon=True)
+        proxy_thread = threading.Thread(target=proxy.main, daemon=True)
         reader_thread.start()
         proxy_thread.start()
 
@@ -845,20 +704,14 @@ def main():
                         if r.exists(f"{state_base(uid)}:ban"):
                             continue
 
-                        log(
-                            f"LOCAL_UNBLOCK_CONFIRMED "
-                            f"uid={uid!r} token={token}"
-                        )
+                        log(f"LOCAL_UNBLOCK_CONFIRMED uid={uid!r} token={token}")
                         announce_local_restoration(uid, token)
                         del observed_bans[uid]
 
                 except redis.RedisError as exc:
                     now_error = time.monotonic()
                     if now_error - last_redis_error > 10:
-                        log(
-                            "Redis ban sync failed; local state "
-                            f"retained: {type(exc).__name__}"
-                        )
+                        log(f"Redis ban sync failed: {type(exc).__name__}")
                         last_redis_error = now_error
 
                 next_ban_check = time.monotonic() + BAN_CHECK_INTERVAL
@@ -866,7 +719,6 @@ def main():
             time.sleep(0.2)
 
     finally:
-        grpc_channel.close()
         if xray_process.poll() is None:
             xray_process.terminate()
             try:
