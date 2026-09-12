@@ -36,17 +36,20 @@ XRAY_API_SERVER = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-inbound"
 XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "/@pycorav1").rstrip("/")
 
-# إعدادات الحظر
-BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))        # الحظر المؤقت
+# إعدادات الحظر والمخالفات
+BLOCK_DURATION = max(10, int(os.environ.get("BLOCK_DURATION", "60")))        # الحظر العادي (ثوانٍ)
 LONG_BLOCK_DURATION = int(os.environ.get("LONG_BLOCK_DURATION", "10800"))    # حظر 3 ساعات
-MAX_STRIKES = int(os.environ.get("MAX_STRIKES", "5"))                        # حد المخالفات
+MAX_STRIKES = int(os.environ.get("MAX_STRIKES", "5"))                        # الحد الأقصى للمخالفات
 
-IP_TTL_SECONDS = max(2, int(os.environ.get("IP_TTL_SECONDS", "12")))
+# مدة حفظ الآيبي (نافذة الرصد): 10 ثوانٍ
+IP_TTL_SECONDS = max(2, int(os.environ.get("IP_TTL_SECONDS", "10")))
+MAX_ALLOWED_NETWORKS = 2  # السماح بآيبيين/شبكتين في نفس الوقت والحظر عند وجود أكثر من 2
+
 SYNC_INTERVAL = max(2, int(os.environ.get("SYNC_INTERVAL", "10")))
 BAN_CHECK_INTERVAL = 1.0
 
 # تثبيت أقنعة الفحص
-V4_PREFIX = 24  # محاسبة أول 3 أرقام (A.B.C) وتجاهل الرقم الأخير
+V4_PREFIX = 24  # تثبيت أول 3 أرقام وتجاهل الأخير
 V6_PREFIX = 32
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -168,12 +171,12 @@ def get_ban_tokens(users):
 
 
 # =============================================================================
-# 4. تطبيع الشبكات وتجاهل 2a03:2880
+# 4. تطبيع الشبكات وتجاهل نطاق 2a03:2880
 # =============================================================================
 
 def normalize_source(raw_ip):
-    # تجاهل وإسقاط أي عنوان يحتوي أو يبدأ بـ 2a03:2880 كلياً
     clean_str = raw_ip.strip().lower()
+    # إسقاط أي اتصال يتبع 2a03:2880 كلياً
     if clean_str.startswith(META_V6_PREFIX) or META_V6_PREFIX in clean_str:
         return None, "ignored-meta-v6"
 
@@ -212,7 +215,7 @@ def network_key(address):
 
 
 # =============================================================================
-# 5. منطق الحظر الذري مع احتساب المخالفات (Redis Lua)
+# 5. قرار الحظر الذري (السماح بـ 2 شبكات، والحظر عند تجاوز 2)
 # =============================================================================
 
 DETECT_LUA = """
@@ -224,12 +227,14 @@ local age = tonumber(ARGV[4])
 local token = ARGV[5]
 local long_duration = tonumber(ARGV[6])
 local max_strikes = tonumber(ARGV[7])
+local max_allowed = tonumber(ARGV[8])
 local event_time = now - age
 
 if redis.call('EXISTS', KEYS[2]) == 1 then
     return {}
 end
 
+-- حذف الشبكات الأقدم من نافذة الـ 10 ثوانٍ
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
 
 local previous = redis.call('ZSCORE', KEYS[1], ARGV[1])
@@ -241,13 +246,15 @@ redis.call('EXPIRE', KEYS[1], math.ceil(window * 3))
 
 local networks = redis.call('ZRANGE', KEYS[1], 0, -1)
 
-if #networks > 1 then
+-- الحظر فقط إذا تجاوز عدد الشبكات المسموح به (أكثر من شبكتين)
+if #networks > max_allowed then
     local strikes = redis.call('INCR', KEYS[3])
-    redis.call('EXPIRE', KEYS[3], 86400)
+    redis.call('EXPIRE', KEYS[3], 86400) -- حفظ سجل المخالفات لـ 24 ساعة
 
     local ban_time = base_duration
     local is_long_ban = 0
 
+    -- عند الوصول للمخالفة الخامسة: حظر 3 ساعات وتصفير العداد
     if strikes >= max_strikes then
         ban_time = long_duration
         is_long_ban = 1
@@ -290,6 +297,7 @@ def observe_network(user_id, address, age):
                 token,
                 LONG_BLOCK_DURATION,
                 MAX_STRIKES,
+                MAX_ALLOWED_NETWORKS,
             ],
         )
 
@@ -308,19 +316,19 @@ def observe_network(user_id, address, age):
                 notify(
                     "🚨 <b>عقوبة مشددة: تم حظر الحساب لمدة 3 ساعات!</b>\n"
                     f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
-                    f"⚠️ السبب: الوصول إلى الحد الأقصى للمخالفات (<b>{MAX_STRIKES} مرات</b>).\n"
-                    f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
+                    f"⚠️ السبب: استنفاد الحد الأقصى للمخالفات (<b>{MAX_STRIKES} مرات</b>).\n"
+                    f"🌐 الشبكات المكتشفة ({len(detected_networks)}): <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
                     "⏱ المدة: <b>3 ساعات (180 دقيقة)</b>\n"
-                    "⛔ تم فصل الاتصال وإيقاف الخدمة."
+                    "⛔ تم فصل الاتصال وإيقاف الخدمة لتجاوز الحد المسموح (أكثر من جهازين)."
                 )
             else:
                 notify(
                     "⛔ <b>تم تسجيل حظر مؤقت للحساب</b>\n"
                     f"👤 المعرف: <code>{html.escape(user_id)}</code>\n"
-                    f"🌐 الشبكات: <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
+                    f"🌐 الشبكات المكتشفة ({len(detected_networks)}): <code>{html.escape(', '.join(detected_networks[:8]))}</code>\n"
                     f"⏱ المدة: {ban_time} ثانية\n"
                     f"⚠️ تنبيه المخالفات: [ <b>{strikes}</b> / {MAX_STRIKES} ]\n"
-                    f"<i>ملاحظة: عند تكرار المخالفة 5 مرات سيتم حظر الحساب تلقائياً لمدة 3 ساعات.</i>"
+                    f"<i>السبب: الاتصال من أكثر من جهازين في نفس الوقت. عند تكرارها 5 مرات يتم الحظر 3 ساعات.</i>"
                 )
 
     except Exception as exc:
@@ -328,7 +336,7 @@ def observe_network(user_id, address, age):
 
 
 # =============================================================================
-# 6. إدارة مستخدمي Xray عبر gRPC
+# 6. إدارة مستخدمي Xray عبر gRPC المباشر (إضافة وحذف)
 # =============================================================================
 
 def encode_varint(value):
@@ -540,7 +548,6 @@ def access_log_reader():
         uid = match.group("uid")
         raw_ip = match.group("ip").strip("[]")
 
-        # يتم إسقاط وتجاهل أي عنوان يبدأ بـ 2a03:2880 فوراً هنا
         address, reason = normalize_source(raw_ip)
         if address is None:
             continue
@@ -591,8 +598,9 @@ def announce_local_restoration(user_id, ban_token):
 
 def main():
     log(
-        f"MODE=NET_BAN duration={BLOCK_DURATION}s long_duration={LONG_BLOCK_DURATION}s "
-        f"window={IP_TTL_SECONDS}s v4=/{V4_PREFIX} v6=/{V6_PREFIX} [Strictly ignoring {META_V6_PREFIX}]"
+        f"MODE=NET_BAN allowed_devices={MAX_ALLOWED_NETWORKS} window={IP_TTL_SECONDS}s "
+        f"duration={BLOCK_DURATION}s long_duration={LONG_BLOCK_DURATION}s "
+        f"v4=/{V4_PREFIX} v6=/{V6_PREFIX} [Ignoring {META_V6_PREFIX}]"
     )
 
     users = get_users()
