@@ -45,11 +45,12 @@ IP_TTL_SECONDS = max(2, int(os.environ.get("IP_TTL_SECONDS", "12")))
 SYNC_INTERVAL = max(2, int(os.environ.get("SYNC_INTERVAL", "10")))
 BAN_CHECK_INTERVAL = 1.0
 
-# تثبيت الأقنعة الصارمة:
-# IPv4: تثبيت أول 3 أرقام (A.B.C) وتجاهل الأخير
-# IPv6: تثبيت أول خانتين (/32) لتوحيد خوادم Meta ومزودي الخدمة
-V4_PREFIX = 24
-V6_PREFIX = 32
+# تثبيت الأقنعة
+V4_PREFIX = 24  # محاسبة أول 3 أرقام (A.B.C) وتجاهل الأخير
+V6_PREFIX = 32  # تثبيت أول خانتين
+
+# نطاق خوادم فيسبوك/ميتا المستثنى نهائياً من أي احتساب
+META_V6_NETWORK = ipaddress.ip_network("2a03:2880::/32")
 
 IGNORED_NETWORKS = os.environ.get("IGNORED_NETWORKS", "")
 
@@ -185,7 +186,7 @@ def get_ban_tokens(users):
 
 
 # =============================================================================
-# 4. تطبيع واقتطاع الشبكات (IPv4 على /24 و IPv6 على /32)
+# 4. تطبيع الشبكات واستبعاد 2a03:2880
 # =============================================================================
 
 def normalize_source(raw_ip):
@@ -224,6 +225,10 @@ def network_key(address):
 
 
 def is_ignored(address):
+    # تجاهل وإسقاط أي عنوان يتبع 2a03:2880 نهائياً
+    if address.version == 6 and address in META_V6_NETWORK:
+        return True
+
     for network in IGNORED_PARSED:
         if network.version == address.version and address in network:
             return True
@@ -267,7 +272,6 @@ if #networks > 1 then
     local ban_time = base_duration
     local is_long_ban = 0
 
-    -- عند الوصول لـ 5 مخالفات: حظر 3 ساعات وتصفير العداد
     if strikes >= max_strikes then
         ban_time = long_duration
         is_long_ban = 1
@@ -348,7 +352,7 @@ def observe_network(user_id, address, age):
 
 
 # =============================================================================
-# 6. إدارة مستخدمي Xray المباشرة عبر gRPC
+# 6. إدارة مستخدمي Xray بالكامل عبر gRPC المباشر (إضافة وحذف)
 # =============================================================================
 
 def encode_varint(value):
@@ -381,6 +385,7 @@ grpc_alter_inbound = grpc_channel.unary_unary(
 
 
 def add_user(user_id, user_uuid):
+    """إضافة المستخدم فوراً إلى Xray عبر gRPC"""
     try:
         account = typed_message(
             "xray.proxy.vless.Account",
@@ -402,20 +407,17 @@ def add_user(user_id, user_uuid):
 
 
 def remove_user(user_id):
-    command = [
-        XRAY_BIN,
-        "api",
-        "rmu",
-        f"--server={XRAY_API_SERVER}",
-        f"-tag={XRAY_INBOUND_TAG}",
-        str(user_id),
-    ]
+    """طرد المستخدم فوراً عبر gRPC المباشر"""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            log(f"API_REMOVE_OK uid={user_id!r}")
-            return True
-        return False
+        operation = typed_message(
+            "xray.app.proxyman.command.RemoveUserOperation",
+            string_field(1, str(user_id)),
+        )
+        payload = string_field(1, XRAY_INBOUND_TAG) + bytes_field(2, operation)
+
+        grpc_alter_inbound(payload, timeout=5)
+        log(f"API_REMOVE_OK uid={user_id!r}")
+        return True
     except Exception as exc:
         log(f"API_REMOVE_FAILED uid={user_id!r}: {exc}")
         return False
@@ -565,6 +567,7 @@ def access_log_reader():
         raw_ip = match.group("ip").strip("[]")
 
         address, reason = normalize_source(raw_ip)
+        # يتم تخطي عناوين 2a03:2880 تلقائياً هنا
         if address is None or is_ignored(address):
             continue
 
@@ -615,7 +618,7 @@ def announce_local_restoration(user_id, ban_token):
 def main():
     log(
         f"MODE=NET_BAN duration={BLOCK_DURATION}s long_duration={LONG_BLOCK_DURATION}s "
-        f"window={IP_TTL_SECONDS}s v4=/{V4_PREFIX} v6=/{V6_PREFIX}"
+        f"window={IP_TTL_SECONDS}s v4=/{V4_PREFIX} v6=/{V6_PREFIX} [Ignored 2a03:2880::/32 permanently]"
     )
 
     users = get_users()
